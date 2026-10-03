@@ -5,10 +5,16 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY beszel_exporter.py .
-
 RUN addgroup -S exporter \
     && adduser -S -G exporter exporter
+
+COPY beszel_exporter.py .
+
+# Do not rely on source-file permissions from the build host/NAS.
+# The runtime user must always be able to traverse /app and read the module.
+RUN chown -R exporter:exporter /app \
+    && chmod 0755 /app \
+    && chmod 0644 /app/beszel_exporter.py /app/requirements.txt
 
 USER exporter
 
