@@ -1,0 +1,8 @@
+scrape_configs:
+  - job_name: beszel
+    scrape_interval: 60s
+    scrape_timeout: 20s
+
+    static_configs:
+      - targets:
+          - beszel-metrics-exporter:9105
