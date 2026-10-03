@@ -1,0 +1,27 @@
+services:
+  beszel-metrics-exporter:
+    build: .
+    container_name: beszel-metrics-exporter
+    restart: unless-stopped
+
+    environment:
+      BESZEL_URL: ${BESZEL_URL:-http://beszel:8090}
+      BESZEL_USER: ${BESZEL_USER:-}
+      BESZEL_PASSWORD: ${BESZEL_PASSWORD:-}
+      BESZEL_TOKEN: ${BESZEL_TOKEN:-}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-10}
+      CACHE_TTL: ${CACHE_TTL:-15}
+
+    ports:
+      - "${EXPORTER_PORT:-9105}:9105"
+
+    read_only: true
+
+    tmpfs:
+      - /tmp
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
