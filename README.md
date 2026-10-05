@@ -1,8 +1,8 @@
 # Beszel Metrics Exporter
 
-A Prometheus-compatible metrics exporter for [Beszel](https://github.com/henrygd/beszel).
+A Prometheus-compatible exporter for [Beszel](https://github.com/henrygd/beszel).
 
-The exporter reads current monitoring data from the Beszel Hub / PocketBase API and exposes it on `/metrics`. It is intended for environments where `vmagent`, Prometheus, VictoriaMetrics, OpenObserve, or another Prometheus-compatible component already handles scraping and/or `remote_write`.
+It reads monitoring data from the Beszel Hub / PocketBase API and exposes it on `/metrics`, allowing `vmagent`, Prometheus, VictoriaMetrics, OpenObserve, Grafana, and other Prometheus-compatible components to consume Beszel data without modifying the Beszel agents.
 
 ## Architecture
 
@@ -23,218 +23,116 @@ Beszel Metrics Exporter :9105/metrics
       | remote_write
       v
 OpenObserve / VictoriaMetrics / other backend
+      |
+      v
+    Grafana
 ```
 
-The exporter does not require changes to Beszel agents and does not write anything to Beszel.
+The exporter is read-only. It never refreshes SMART/ZFS/systemd data and never writes to Beszel collections.
 
-## Exported data
+## Highlights
 
-The exporter reads the following Beszel collections when available:
+- Host CPU, memory, storage, network, temperature, fan, battery and Wi-Fi metrics
+- Per-interface network counters and rates
+- Docker / Podman container metrics
+- SMART device and SMART attribute metrics
+- systemd service metrics
+- Beszel network-monitor latency, packet loss, probe and TLS certificate metrics
+- ZFS / Btrfs pools, vdevs, datasets and scrub state
+- GPU utilization, memory, power and engine metrics
+- Prometheus metric families with `# HELP` and `# TYPE`
+- Bounded bulk retrieval for Beszel `1m` history records
+- Stale-data suppression
+- Last-good-data fallback during Beszel Hub outages
+- Read-only, non-root container image
+- Unit tests, Ruff, `promtool check metrics`, Docker smoke tests and multi-arch GHCR publishing
+
+## Data retrieval model
+
+The exporter reads current-state collections such as:
 
 - `systems`
 - `system_details`
-- `system_stats`
 - `containers`
-- `container_stats`
 - `smart_devices`
 - `systemd_services`
 - `network_monitors`
-- `network_monitor_stats`
 - `zfs_pools`
 
-Optional collections are handled independently. If an optional collection is unavailable or inaccessible, the exporter continues serving the remaining metrics and increments `beszel_exporter_collection_errors_total`.
+For high-frequency history collections:
 
-### Host metrics
+- `system_stats`
+- `container_stats`
+- `network_monitor_stats`
 
-- Host availability and uptime
-- CPU usage and peak CPU usage
-- Per-core CPU usage
-- CPU user/system/iowait/steal/idle breakdown
-- Load average: 1, 5 and 15 minutes
-- Total/used memory and memory utilization
-- Buffer/cache memory
-- ZFS ARC memory
-- Swap total/used
-- Root filesystem total/used/utilization
-- Disk read/write throughput
-- Disk cumulative read/write counters
-- Disk utilization
-- Read/write await latency
-- Weighted I/O
-- Network transmit/receive throughput
-- Per-interface transmit/receive throughput
-- Per-interface cumulative byte counters
-- Temperatures
-- Fan speeds
-- Battery state and percentage
-- Wi-Fi RSSI
-- Package update counts
-- systemd service summary
-- Agent and host information
+it does **not** execute one historical query per system/monitor. Instead, it scans newest `type="1m"` records in bounded pages and keeps the first record for each relation ID. With normal active systems this usually reduces the history lookup to approximately three API requests per exporter refresh instead of multiple requests per system and monitor.
 
-### Extra filesystems
+`BeszelAPI.latest()` is also implemented as a true one-record query using `perPage=1`, `sort=-created`, and `skipTotal=1`; it does not traverse all pages.
 
-For filesystems collected by Beszel, the exporter exposes:
+## Stale data handling
 
-- Total and used space
-- Utilization percentage
-- Read/write throughput
-- Read/write cumulative counters
-- Read/write peak throughput when present
-- I/O utilization and await statistics
+Prometheus cannot know that a value read from a persistent Beszel record is old. Without explicit handling, a stopped host could continue exporting its last CPU, memory or temperature sample as if it were current.
 
-### GPU metrics
-
-- GPU utilization
-- GPU memory used/total
-- GPU power
-- Package power where available
-- Per-engine utilization where provided by Beszel
-
-### Docker / Podman containers
-
-- CPU usage
-- Memory usage
-- Aggregate network throughput
-- TX/RX network throughput from `container_stats`
-- Health state
-- Update availability
-- Container metadata through an `*_info` metric
-
-Container image, ID, status and port data are kept on the single `beszel_container_info` series instead of being duplicated across every container metric.
-
-### SMART
-
-- SMART overall state
-- Capacity
-- Temperature
-- Power-on hours
-- Power cycles
-- Normalized SMART attribute value
-- Worst value
-- Threshold
-- Raw numeric value
-
-SMART raw strings are intentionally not exported as metric labels. Values such as changing human-readable power-on-time strings would otherwise create unnecessary time-series cardinality.
-
-### systemd services
-
-- Active/failed state
-- Main state and substate in `beszel_systemd_service_info`
-- CPU current/peak
-- Memory current/peak
-
-### Network monitors
-
-- Enabled state and configured interval
-- Current latency
-- 1-hour average/min/max latency
-- 1-minute average/min/max latency derived from `network_monitor_stats`
-- Current, 1-hour and 1-minute packet loss
-- Probe counts
-- TLS certificate expiration timestamp
-- TLS certificate days remaining
-- Certificate issuer
-
-Beszel stores network monitor response time in microseconds. The exporter converts it to seconds to follow Prometheus naming conventions.
-
-### ZFS / Btrfs storage pools
-
-- Pool size/allocated/free
-- Health
-- Read/write throughput from current system statistics
-- Scrub state/progress/errors
-- Vdev state and read/write/checksum errors
-- Dataset used/available space
-
-Beszel identifies Btrfs pools with its internal `b:` pool-name prefix. The exporter exposes a `pool_type` label with either `zfs` or `btrfs`.
-
-## What is not exported
-
-### Arbitrary OS processes
-
-Beszel does not currently persist a generic per-process dataset containing PID, command, user, CPU, RSS, VSZ and per-process I/O in the Hub collections used by this exporter.
-
-`systemd_services` is exported because Beszel does collect those service-level metrics.
-
-If arbitrary process metrics are required, run a dedicated Prometheus process exporter as another `vmagent` scrape target instead of trying to synthesize data that Beszel does not expose.
-
-## Metric naming
-
-All metrics use the `beszel_` prefix.
-
-Common labels:
-
-| Label | Meaning |
-| --- | --- |
-| `system` | Beszel system name |
-| `system_id` | Beszel/PocketBase system record ID |
-| `container` | Container name |
-| `interface` | Network interface name |
-| `filesystem` | Extra filesystem identifier |
-| `gpu` | GPU identifier |
-| `device` | SMART device name |
-| `service` | systemd service name |
-| `monitor_id` | Network monitor record ID |
-| `target` | Network monitor target |
-| `pool` | Storage pool identifier |
-
-Examples:
+The exporter therefore emits:
 
 ```text
-beszel_system_cpu_usage_percent{system="nas01",system_id="..."} 7.12
-
-beszel_system_cpu_time_percent{mode="iowait",system="nas01",system_id="..."} 0.42
-
-beszel_system_network_interface_bytes_per_second{direction="receive",interface="eth0",system="nas01",system_id="..."} 24812
-
-beszel_container_cpu_usage_percent{container="immich-server",system="nas01",system_id="..."} 3.81
-
-beszel_smart_temperature_celsius{device="/dev/sda",system="nas01",system_id="..."} 37
-
-beszel_network_monitor_response_seconds{protocol="icmp",target="1.1.1.1",window="1m_avg",system="nas01",system_id="..."} 0.0124
+beszel_system_stats_age_seconds
+beszel_container_stats_age_seconds
+beszel_network_monitor_stats_age_seconds
 ```
 
-## Unit normalization
+Dynamic host/container/SMART/systemd/network-monitor/storage values are suppressed when the source system does not have fresh `system_stats` data.
 
-The exporter normalizes several Beszel values to Prometheus-friendly base units:
+Default freshness limit:
 
-| Beszel source | Exported unit |
-| --- | --- |
-| Host memory / filesystem capacity stored as GiB | bytes |
-| Container and GPU memory stored as MiB | bytes |
-| Network monitor response time stored as microseconds | seconds |
-| Network monitor certificate expiration stored as milliseconds since epoch | seconds since epoch |
-| Per-interface network rate | bytes/second |
-| Disk I/O rate | bytes/second |
+```text
+MAX_STATS_AGE_SECONDS=180
+```
 
-Legacy Beszel MiB/s fields are retained with `_mib_per_second` in their metric names so the unit is explicit.
+The separate network-monitor history record limit defaults to:
 
-## Requirements
+```text
+MAX_MONITOR_STATS_AGE_SECONDS=600
+```
 
-- A reachable Beszel Hub
-- A Beszel user that can read monitored systems and the related collections
-- Docker / Docker Compose for the provided deployment example
-- A Prometheus-compatible scraper such as `vmagent`
+Static identity metadata and `beszel_system_up` remain available so a failed source is still identifiable.
 
-Python 3.13 is used by the supplied container image.
+## Hub failure behavior
+
+If the required `systems` request fails, the exporter:
+
+1. logs the detailed exception server-side;
+2. serves the last successful metric snapshot, if one exists;
+3. changes `beszel_exporter_up` to `0`;
+4. retains `beszel_exporter_last_success_timestamp_seconds`;
+5. caches the failed result briefly (`FAILURE_CACHE_TTL`, default 5 seconds).
+
+This avoids a queue of repeated 10-second Hub timeouts when multiple scrape requests arrive during a Hub outage.
+
+The HTTP response does **not** expose the internal exception text or Beszel URL.
 
 ## Authentication
 
-Two authentication modes are supported.
+### Recommended: dedicated readonly user
 
-### Username and password
+Create a dedicated Beszel user with role `readonly` and grant it access to the monitored systems.
 
-This is the recommended option for long-running deployments. Create a dedicated read-only Beszel account and configure:
+Beszel system access and the `readonly` role are separate concepts: a readonly user still needs to be present in each system's `users` relation unless the Hub is configured with:
+
+```text
+BESZEL_HUB_SHARE_ALL_SYSTEMS=true
+```
+
+Configure the exporter with:
 
 ```env
 BESZEL_USER=monitoring@example.invalid
 BESZEL_PASSWORD=change-me
 ```
 
-The exporter re-authenticates automatically after an HTTP 401 response.
+The exporter re-authenticates when a password-authenticated request receives HTTP 401.
 
-### Existing PocketBase token
+### Static token
 
 Alternatively:
 
@@ -242,38 +140,23 @@ Alternatively:
 BESZEL_TOKEN=your-token
 ```
 
-When `BESZEL_TOKEN` is set, username/password authentication is not used. A static token may expire depending on the Beszel/PocketBase configuration, so username/password authentication is normally preferable for an unattended exporter.
+When `BESZEL_TOKEN` is set, username/password authentication is not used. Static-token expiry behavior depends on the Beszel/PocketBase configuration, so username/password authentication is generally safer for unattended operation.
 
 ## Quick start
-
-Clone the repository:
 
 ```bash
 git clone https://github.com/pi4-dev/beszel-metrics-exporter.git
 cd beszel-metrics-exporter
-```
-
-Create the local environment file:
-
-```bash
 cp .env.example .env
 ```
 
-Edit `.env` and configure at least:
-
-```env
-BESZEL_URL=http://beszel:8090
-BESZEL_USER=monitoring@example.invalid
-BESZEL_PASSWORD=change-me
-```
-
-Build and start:
+Edit `.env`, then start:
 
 ```bash
 docker compose up -d --build
 ```
 
-Check health:
+Health check:
 
 ```bash
 curl http://127.0.0.1:9105/healthz
@@ -285,160 +168,255 @@ Expected response:
 {"status":"ok"}
 ```
 
-Check metrics:
+Metrics:
 
 ```bash
 curl -s http://127.0.0.1:9105/metrics | less
 ```
 
-## vmagent integration
+## Network exposure
 
-An example is included in `vmagent-scrape.yaml`:
-
-```yaml
-scrape_configs:
-  - job_name: beszel
-    scrape_interval: 60s
-    scrape_timeout: 20s
-
-    static_configs:
-      - targets:
-          - beszel-metrics-exporter:9105
-```
-
-Merge that job into the existing `vmagent` scrape configuration.
-
-The exporter is intentionally independent of the `remote_write` destination. Existing `vmagent -> OpenObserve`, `vmagent -> VictoriaMetrics`, or other remote-write configuration can remain unchanged.
-
-## OpenObserve topology
-
-A typical deployment is:
-
-```text
-Beszel Hub
-    |
-    v
-Beszel Metrics Exporter
-    |
-    v
-vmagent
-    |
-    +---- remote_write ----> OpenObserve
-```
-
-This avoids adding a second telemetry collector to every monitored host: Beszel agents continue collecting the host/container/storage data, while this exporter converts the Hub data into Prometheus time series.
-
-## Configuration
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `BESZEL_URL` | `http://beszel:8090` | Beszel Hub URL visible from the exporter |
-| `BESZEL_USER` | empty | Beszel/PocketBase user |
-| `BESZEL_PASSWORD` | empty | Beszel/PocketBase password |
-| `BESZEL_TOKEN` | empty | Optional existing auth token |
-| `REQUEST_TIMEOUT` | `10` | HTTP request timeout in seconds |
-| `CACHE_TTL` | `15` | Exporter result cache in seconds |
-| `LISTEN_HOST` | `0.0.0.0` | Flask development-server bind address; Gunicorn binds separately in Docker |
-| `LISTEN_PORT` | `9105` | Flask development-server port |
-| `EXPORTER_PORT` | `9105` | Host port used by the supplied Compose file |
-
-## Caching
-
-A single `/metrics` request can query several Beszel collections. To avoid repeatedly hitting the Hub when multiple scrapers request metrics at nearly the same time, the complete exposition is cached for `CACHE_TTL` seconds.
-
-For the provided 60-second `vmagent` scrape interval, a 15-second cache is a reasonable default.
-
-## Cardinality considerations
-
-The exporter deliberately avoids placing fast-changing values into labels.
-
-Examples:
-
-- SMART raw strings are not labels.
-- Container image, ID, status and port information are isolated in `beszel_container_info`.
-- Numeric health, CPU, memory and network values remain metric samples, not labels.
-
-Some dimensions are inherently cardinality-producing, including SMART attributes, GPU engines, filesystems, network interfaces, systemd services and network monitor targets. Review retention and cardinality limits when monitoring many Beszel systems.
-
-## Security
-
-- Use a dedicated read-only Beszel account.
-- Do not commit `.env`; it is ignored by `.gitignore`.
-- Keep the exporter on a trusted monitoring network.
-- `/metrics` is not authenticated by the exporter.
-- If `vmagent` runs on the same host, consider binding the published port to loopback instead of all interfaces.
-
-For a same-host deployment, change the Compose port mapping to:
+The supplied Compose file publishes the exporter only on loopback:
 
 ```yaml
 ports:
   - "127.0.0.1:9105:9105"
 ```
 
+This is intentional because the endpoint contains infrastructure metadata such as hostnames, container images, SSIDs and disk serial numbers.
+
+If `vmagent` shares a Docker network with the exporter, the safer configuration is to remove `ports:` entirely and scrape:
+
+```text
+beszel-metrics-exporter:9105
+```
+
+from that internal network.
+
+## vmagent
+
+An example scrape job is provided in `vmagent-scrape.yaml`:
+
+```yaml
+scrape_configs:
+  - job_name: beszel
+    scrape_interval: 60s
+    scrape_timeout: 20s
+    static_configs:
+      - targets:
+          - beszel-metrics-exporter:9105
+```
+
+The exporter is independent of the remote-write target. Existing `vmagent -> OpenObserve` or `vmagent -> VictoriaMetrics` configuration does not need to change.
+
+For Grafana/OpenObserve dashboards it is recommended to include the scrape job in selectors:
+
+```promql
+{job="beszel"}
+```
+
+This prevents dashboard variables from mixing label values from unrelated jobs.
+
+## Configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `BESZEL_URL` | `http://beszel:8090` | Beszel Hub URL from the exporter container |
+| `BESZEL_USER` | empty | Beszel user email |
+| `BESZEL_PASSWORD` | empty | Beszel password |
+| `BESZEL_TOKEN` | empty | Optional PocketBase auth token |
+| `REQUEST_TIMEOUT` | `10` | HTTP timeout per Hub request |
+| `CACHE_TTL` | `15` | Successful full-scrape cache TTL |
+| `FAILURE_CACHE_TTL` | `5` | Negative-cache TTL after a required Hub request fails |
+| `MAX_STATS_AGE_SECONDS` | `180` | Maximum age of dynamic host data |
+| `MAX_MONITOR_STATS_AGE_SECONDS` | `600` | Maximum age of `network_monitor_stats` used for 1m aggregates |
+| `BULK_PAGE_SIZE` | `500` | Page size for bulk newest-record scans |
+| `BULK_MAX_PAGES` | `5` | Maximum pages scanned per bulk history collection |
+| `LEGACY_UNITS` | `false` | Emit deprecated MiB/s and millisecond-await metric names |
+| `LOG_LEVEL` | `INFO` | Python log level |
+| `LISTEN_HOST` | `0.0.0.0` | Gunicorn bind address |
+| `LISTEN_PORT` | `9105` | Gunicorn bind port |
+| `EXPORTER_PORT` | `9105` | Host loopback port in the supplied Compose file |
+
+Unlike the initial implementation, `LISTEN_HOST` and `LISTEN_PORT` are used by both direct Python execution and the production Gunicorn container through `gunicorn.conf.py`.
+
+## Metric conventions
+
+All metrics use the `beszel_` prefix.
+
+### Base units
+
+Prometheus base units are used by default:
+
+- capacity / memory: bytes
+- throughput: bytes/second
+- latency / await: seconds
+- temperatures: Celsius
+- percentages: percentage points (`0..100`)
+- timestamps: Unix seconds
+
+Beszel fields stored as GiB, MiB, microseconds or milliseconds are converted by the exporter.
+
+Older Beszel rate fields expressed in MiB/s are converted to bytes/s when newer byte-based fields are unavailable. Their original `*_mib_per_second` metric names are emitted only with:
+
+```env
+LEGACY_UNITS=true
+```
+
+The same flag temporarily restores deprecated `*_await_milliseconds` series while the default metrics use `*_await_seconds`.
+
+### Label cardinality
+
+Fast-changing metadata is intentionally isolated in `*_info` metrics.
+
+For example, SMART metadata:
+
+```text
+beszel_smart_device_info{device=...,serial=...,model=...,firmware=...,state=...} 1
+```
+
+while numeric SMART metrics carry only stable device identity labels such as `device` and `serial`.
+
+Container image, container ID, status and port strings are similarly restricted to `beszel_container_info`.
+
+## Container network metrics
+
+TX/RX use:
+
+```text
+beszel_container_network_bytes_per_second{direction="transmit"}
+beszel_container_network_bytes_per_second{direction="receive"}
+```
+
+The aggregate value from the current Beszel container record is separate:
+
+```text
+beszel_container_network_combined_bytes_per_second
+```
+
+There is intentionally no `direction="total"` sample in the TX/RX family, because summing the old family without filtering `direction` double-counted traffic.
+
+## Network-monitor metrics
+
+Important series include:
+
+```text
+beszel_network_monitor_enabled
+beszel_network_monitor_interval_seconds
+beszel_network_monitor_response_seconds
+beszel_network_monitor_packet_loss_percent
+beszel_network_monitor_probe_count
+beszel_network_monitor_stats_age_seconds
+beszel_network_monitor_tls_cert_expiry_timestamp_seconds
+beszel_network_monitor_tls_cert_info
+```
+
+Common labels:
+
+```text
+system
+system_id
+monitor_id
+target
+protocol
+port
+server
+```
+
+Latency windows include, where available:
+
+```text
+current
+1m_min
+1m_avg
+1m_max
+1h_min
+1h_avg
+1h_max
+```
+
+Packet-loss windows include:
+
+```text
+current
+1m
+1h
+```
+
+### TLS days remaining
+
+`beszel_network_monitor_tls_cert_days_remaining` is intentionally no longer exported because it can be derived without creating another stored time series:
+
+```promql
+(beszel_network_monitor_tls_cert_expiry_timestamp_seconds - time()) / 86400
+```
+
+## SMART metrics
+
+Numeric SMART series do not include `model` or `firmware` labels. Those fields are present only on `beszel_smart_device_info`, preventing a firmware upgrade from creating new copies of every SMART attribute time series.
+
+SMART raw human-readable strings are not exported as labels.
+
 ## Exporter self-monitoring
 
-The exporter exposes:
-
-- `beszel_exporter_up`
-- `beszel_exporter_scrape_duration_seconds`
-- `beszel_exporter_last_success_timestamp_seconds`
-- `beszel_exporter_collection_errors_total{collection="..."}`
-
-`beszel_exporter_collection_errors_total` is useful when Beszel adds/removes a collection, access rules change, or a read-only account cannot access a specific dataset.
-
-## Troubleshooting
-
-### HTTP 401 / 403 from Beszel
-
-Verify credentials and collection access. A dedicated account must be able to list the systems it is expected to export.
-
-### `/metrics` returns HTTP 500
-
-Check exporter logs:
-
-```bash
-docker compose logs -f beszel-metrics-exporter
+```text
+beszel_exporter_up
+beszel_exporter_scrape_duration_seconds
+beszel_exporter_last_success_timestamp_seconds
+beszel_exporter_collection_errors_total{collection="..."}
 ```
 
-Then test Beszel reachability from the exporter network.
+`beszel_exporter_collection_errors_total` increments when an optional Beszel collection cannot be read. Detailed causes are written to exporter logs.
 
-### Some metric groups are missing
+## Breaking changes from the initial version
 
-Not every Beszel installation has every feature enabled. For example, SMART, ZFS/Btrfs, systemd, GPU data, Wi-Fi, or network monitors may legitimately be absent.
+| Old behavior / metric | New behavior |
+| --- | --- |
+| `*_await_milliseconds` | `*_await_seconds` by default; old names require `LEGACY_UNITS=true` |
+| Always exported `*_mib_per_second` | disabled by default; byte/second metrics are preferred |
+| `beszel_container_network_bytes_per_second{direction="total"}` | replaced by `beszel_container_network_combined_bytes_per_second` |
+| SMART `model` / `firmware` on every numeric series | metadata moved to `beszel_smart_device_info` |
+| `beszel_network_monitor_tls_cert_days_remaining` | calculate from expiry timestamp in PromQL |
+| Persistent last host values exported indefinitely | stale dynamic metrics are suppressed |
 
-Check:
+## Metric exposition format
 
-```bash
-curl -s http://127.0.0.1:9105/metrics | grep beszel_exporter_collection_errors
+Metric samples are grouped by family and every family contains both metadata lines:
+
+```text
+# HELP beszel_system_cpu_usage_percent ...
+# TYPE beszel_system_cpu_usage_percent gauge
+beszel_system_cpu_usage_percent{...} 12.3
 ```
 
-### vmagent target is down
-
-Verify the exporter from the `vmagent` network namespace / container network and check the target address in `vmagent-scrape.yaml`.
+The collector rejects duplicate name+label samples before rendering. CI also validates mocked exporter output with `promtool check metrics`.
 
 ## Development
 
-Run directly:
+Create a virtual environment and install the pinned development dependencies:
 
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-pip install -r requirements.txt
-
-export BESZEL_URL=http://127.0.0.1:8090
-export BESZEL_USER=monitoring@example.invalid
-export BESZEL_PASSWORD=change-me
-
-python beszel_exporter.py
+pip install -r requirements-dev.txt
 ```
 
-Syntax validation:
+Run lint and tests:
 
 ```bash
-python -m py_compile beszel_exporter.py
+ruff check .
+pytest -q
 ```
 
-Container build:
+Validate representative Prometheus output:
+
+```bash
+PYTHONPATH=.:tests python tests/render_mock_metrics.py > /tmp/beszel.metrics
+docker run --rm -i --entrypoint /bin/promtool \
+  prom/prometheus:v3.15.0 check metrics < /tmp/beszel.metrics
+```
+
+Build the container:
 
 ```bash
 docker build -t beszel-metrics-exporter .
@@ -446,40 +424,84 @@ docker build -t beszel-metrics-exporter .
 
 ## CI
 
-The included GitHub Actions workflow validates Python syntax and builds the container image on pushes and pull requests.
+CI runs on pull requests and pushes to `main` (avoiding duplicate push+PR runs for feature branches) and performs:
 
-## Compatibility notes
+1. Ruff linting
+2. pytest unit tests
+3. mocked metric generation
+4. `promtool check metrics`
+5. Docker build
+6. container startup smoke test
+7. `/healthz` check
+8. failure-mode `/metrics` check
 
-This exporter intentionally consumes Beszel's Hub/PocketBase data model rather than an official Prometheus endpoint. Beszel may change collection fields between releases.
+GitHub Actions are pinned to commit SHAs.
 
-Failure of an optional collection is isolated where possible, and the exporter exposes per-collection error counters to make schema/access regressions visible.
+## Container publishing
 
-When upgrading Beszel, verify at least:
+The `Publish container` workflow publishes multi-architecture images for:
 
-```bash
-curl -fsS http://127.0.0.1:9105/metrics >/tmp/beszel.metrics
-grep '^beszel_exporter_up ' /tmp/beszel.metrics
-grep '^beszel_exporter_collection_errors_total' /tmp/beszel.metrics
+```text
+linux/amd64
+linux/arm64
 ```
+
+to:
+
+```text
+ghcr.io/pi4-dev/beszel-metrics-exporter
+```
+
+`main` publishes `latest` and SHA tags; `v*` Git tags also publish a matching version tag.
+
+## Dependency management
+
+Runtime dependencies are pinned in `requirements.lock`; development tools are pinned in `requirements-dev.txt`. Dependabot is configured for Python, Docker and GitHub Actions.
 
 ## Repository layout
 
 ```text
 .
-|-- .env.example
-|-- .github/workflows/ci.yml
-|-- .dockerignore
-|-- .gitignore
-|-- Dockerfile
-|-- README.md
-|-- beszel_exporter.py
-|-- compose.yaml
-|-- requirements.txt
-`-- vmagent-scrape.yaml
+├── .env.example
+├── .github/
+│   ├── dependabot.yml
+│   └── workflows/
+│       ├── ci.yml
+│       └── publish.yml
+├── Dockerfile
+├── README.md
+├── beszel_exporter.py
+├── compose.yaml
+├── gunicorn.conf.py
+├── pyproject.toml
+├── pytest.ini
+├── requirements.in
+├── requirements.lock
+├── requirements.txt
+├── requirements-dev.txt
+├── tests/
+│   ├── conftest.py
+│   ├── render_mock_metrics.py
+│   └── test_exporter.py
+└── vmagent-scrape.yaml
 ```
 
-## Upstream
+## Upstream compatibility
 
-Beszel project: https://github.com/henrygd/beszel
+This project consumes Beszel's Hub/PocketBase data model rather than an official Beszel Prometheus endpoint. Collection schemas can change between Beszel releases.
 
-This project is an independent exporter and is not part of the upstream Beszel project.
+When upgrading Beszel, verify:
+
+```bash
+curl -fsS http://127.0.0.1:9105/metrics >/tmp/beszel.metrics
+grep '^beszel_exporter_up ' /tmp/beszel.metrics
+grep '^beszel_exporter_collection_errors_total' /tmp/beszel.metrics || true
+```
+
+and review exporter logs for collection/schema errors.
+
+## Upstream project
+
+Beszel: https://github.com/henrygd/beszel
+
+This exporter is independent and is not part of the upstream Beszel project.

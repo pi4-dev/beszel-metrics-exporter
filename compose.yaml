@@ -5,23 +5,31 @@ services:
     restart: unless-stopped
 
     environment:
-      BESZEL_URL: ${BESZEL_URL:-http://beszel:8090}
-      BESZEL_USER: ${BESZEL_USER:-}
-      BESZEL_PASSWORD: ${BESZEL_PASSWORD:-}
-      BESZEL_TOKEN: ${BESZEL_TOKEN:-}
-      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-10}
-      CACHE_TTL: ${CACHE_TTL:-15}
+      BESZEL_URL: \${BESZEL_URL:-http://beszel:8090}
+      BESZEL_USER: \${BESZEL_USER:-}
+      BESZEL_PASSWORD: \${BESZEL_PASSWORD:-}
+      BESZEL_TOKEN: \${BESZEL_TOKEN:-}
+      REQUEST_TIMEOUT: \${REQUEST_TIMEOUT:-10}
+      CACHE_TTL: \${CACHE_TTL:-15}
+      FAILURE_CACHE_TTL: \${FAILURE_CACHE_TTL:-5}
+      MAX_STATS_AGE_SECONDS: \${MAX_STATS_AGE_SECONDS:-180}
+      MAX_MONITOR_STATS_AGE_SECONDS: \${MAX_MONITOR_STATS_AGE_SECONDS:-600}
+      BULK_PAGE_SIZE: \${BULK_PAGE_SIZE:-500}
+      BULK_MAX_PAGES: \${BULK_MAX_PAGES:-5}
+      LEGACY_UNITS: \${LEGACY_UNITS:-false}
+      LOG_LEVEL: \${LOG_LEVEL:-INFO}
+      LISTEN_HOST: 0.0.0.0
+      LISTEN_PORT: 9105
 
+    # Safe default for host-based vmagent/curl access. If vmagent shares a
+    # Docker network with this service, remove ports and scrape the service name.
     ports:
-      - "${EXPORTER_PORT:-9105}:9105"
+      - "127.0.0.1:\${EXPORTER_PORT:-9105}:9105"
 
     read_only: true
-
     tmpfs:
       - /tmp
-
     security_opt:
       - no-new-privileges:true
-
     cap_drop:
       - ALL

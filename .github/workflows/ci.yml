@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
@@ -12,27 +14,42 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
+          cache: pip
 
-      - name: Validate Python syntax
-        run: python -m py_compile beszel_exporter.py
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest -q
+
+      - name: Render mocked metrics
+        run: PYTHONPATH=.:tests python tests/render_mock_metrics.py > /tmp/beszel.metrics
+
+      - name: Validate Prometheus exposition
+        run: docker run --rm -i --entrypoint /bin/promtool prom/prometheus:v3.15.0 check metrics < /tmp/beszel.metrics
 
       - name: Build container
         run: docker build -t beszel-metrics-exporter:test .
 
-      - name: Smoke-test container startup
+      - name: Smoke-test container startup and failure-mode metrics
         run: |
-          docker run -d --rm --name beszel-metrics-exporter-test -p 9105:9105 beszel-metrics-exporter:test
+          docker run -d --rm --name beszel-metrics-exporter-test -p 127.0.0.1:9105:9105 beszel-metrics-exporter:test
           trap 'docker logs beszel-metrics-exporter-test || true; docker stop beszel-metrics-exporter-test || true' EXIT
           for i in $(seq 1 20); do
             if curl -fsS http://127.0.0.1:9105/healthz >/dev/null; then
-              exit 0
+              break
             fi
             sleep 1
           done
-          docker logs beszel-metrics-exporter-test
-          exit 1
+          curl -fsS http://127.0.0.1:9105/healthz
+          curl -fsS http://127.0.0.1:9105/metrics | grep '^beszel_exporter_up 0$'
