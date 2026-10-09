@@ -355,7 +355,7 @@ class BeszelAPI:
             if len(items) < BULK_PAGE_SIZE:
                 # Exhausted all fresh records: missing/down/disabled IDs are normal.
                 break
-            if page == BULK_MAX_PAGES:
+            if pending and page == BULK_MAX_PAGES:
                 logger.warning(
                     "Fresh Beszel history scan reached page limit for %s (%s IDs still missing)",
                     collection,
