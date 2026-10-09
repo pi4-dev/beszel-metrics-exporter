@@ -599,3 +599,140 @@ def test_hub_failure_before_initial_success_has_only_self_metrics(monkeypatch):
     assert "beszel_system_info" not in failed
     assert "beszel_system_up" not in failed
     assert "beszel_system_cpu_usage_percent" not in failed
+
+
+class BudgetResponse:
+    def __init__(self, data, status=200):
+        self.data = data
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self.data
+
+
+def test_http_requests_share_one_budget_across_auth_and_401_retry(monkeypatch):
+    tick = [100.0]
+    monkeypatch.setattr(exporter.time, "monotonic", lambda: tick[0])
+    monkeypatch.setattr(exporter, "REQUEST_TIMEOUT", 10)
+    monkeypatch.setattr(exporter, "BESZEL_USER", "user")
+    monkeypatch.setattr(exporter, "BESZEL_PASSWORD", "secret")
+    monkeypatch.setattr(exporter, "BESZEL_TOKEN", "")
+
+    class MockSession:
+        def __init__(self):
+            self.headers = {}
+            self.calls = []
+            self.gets = 0
+
+        def post(self, url, json, timeout):
+            self.calls.append(("post", timeout))
+            tick[0] += 1
+            return BudgetResponse({"token": "new-token"})
+
+        def get(self, url, params, timeout):
+            self.calls.append(("get", timeout))
+            self.gets += 1
+            tick[0] += 1
+            return BudgetResponse({"items": []}, 401 if self.gets == 1 else 200)
+
+    api = exporter.BeszelAPI()
+    api.session = MockSession()
+    token = exporter._SCRAPE_DEADLINE.set(106.0)
+    try:
+        assert api.get("/test") == {"items": []}
+        assert api.session.calls == [
+            ("post", 6.0), ("get", 5.0), ("post", 4.0), ("get", 3.0),
+        ]
+        tick[0] = 106.0
+        with pytest.raises(exporter.ScrapeDeadlineExceeded):
+            api.get("/test")
+        assert len(api.session.calls) == 4
+    finally:
+        exporter._SCRAPE_DEADLINE.reset(token)
+
+
+def test_records_and_bulk_pagination_stop_on_shared_deadline(monkeypatch):
+    tick = [100.0]
+    monkeypatch.setattr(exporter.time, "monotonic", lambda: tick[0])
+    monkeypatch.setattr(exporter, "BULK_PAGE_SIZE", 1)
+
+    class SlowPages(exporter.BeszelAPI):
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, path, params=None):
+            self.calls += 1
+            tick[0] += 3
+            return {"items": [{"system": "another"}], "totalPages": 100}
+
+    api = SlowPages()
+    token = exporter._SCRAPE_DEADLINE.set(105.0)
+    try:
+        with pytest.raises(exporter.ScrapeDeadlineExceeded):
+            api.records("systems", per_page=1)
+        assert api.calls == 2
+        api.calls = 0
+        tick[0] = 100.0
+        with pytest.raises(exporter.ScrapeDeadlineExceeded):
+            api.latest_by_relation(
+                "system_stats", "system", {"offline"},
+                fields="system,stats,created,type",
+            )
+        assert api.calls == 2
+    finally:
+        exporter._SCRAPE_DEADLINE.reset(token)
+
+
+def test_slow_optional_collection_aborts_without_partial_success(monkeypatch):
+    tick = [100.0]
+    monkeypatch.setattr(exporter.time, "monotonic", lambda: tick[0])
+    monkeypatch.setattr(exporter, "SCRAPE_BUDGET_SECONDS", 5)
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+
+    class SlowOptional(FakeAPI):
+        def __init__(self, now):
+            super().__init__(now)
+            self.slow = False
+            self.calls = []
+
+        def records(self, collection, **kwargs):
+            self.calls.append(collection)
+            if self.slow and collection == "containers":
+                tick[0] += 6
+            return super().records(collection, **kwargs)
+
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    api = SlowOptional(now)
+    collector = exporter.BeszelCollector(api=api, clock=lambda: now)
+    good = collector.collect()
+    assert "beszel_exporter_up 1" in good
+    assert "beszel_system_cpu_usage_percent" in good
+    api.slow = True
+    api.calls.clear()
+    failed = collector.collect()
+    assert "beszel_exporter_up 0" in failed
+    assert "beszel_system_info" in failed
+    assert "beszel_system_cpu_usage_percent" not in failed
+    assert "beszel_system_up" not in failed
+    assert "smart_devices" not in api.calls
+    assert exporter._SCRAPE_DEADLINE.get() is None
+
+
+def test_lock_wait_is_bounded_by_total_scrape_budget(monkeypatch):
+    monkeypatch.setattr(exporter, "SCRAPE_BUDGET_SECONDS", 0.01)
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    collector = exporter.BeszelCollector(api=FakeAPI(now), clock=lambda: now)
+    assert collector.lock.acquire(blocking=False)
+    try:
+        started = exporter.time.monotonic()
+        response = collector.collect()
+        assert exporter.time.monotonic() - started < 0.5
+        assert "beszel_exporter_up 0" in response
+        assert "beszel_system_info" not in response
+        assert "beszel_exporter_scrape_duration_seconds" in response
+    finally:
+        collector.lock.release()
