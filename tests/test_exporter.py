@@ -281,9 +281,8 @@ def test_container_info_status_does_not_change_with_uptime(monkeypatch):
     first = collector.collect()
     api.status = "Up 3 hours (healthy)"
     second = collector.collect()
-    info_line = lambda output: next(
-        line for line in output.splitlines() if line.startswith("beszel_container_info{")
-    )
+    def info_line(output):
+        return next(line for line in output.splitlines() if line.startswith("beszel_container_info{"))
     assert info_line(first) == info_line(second)
     assert 'status="running"' in info_line(second)
     assert "3 hours" not in second
