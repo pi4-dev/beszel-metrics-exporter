@@ -914,7 +914,8 @@ class BeszelCollector:
         for gpu_id, gpu in decoded(stats.get("g"), {}).items():
             if not isinstance(gpu, dict):
                 continue
-            gpu_labels = {**labels, "gpu": gpu_id, "name": gpu.get("n", "")}
+            gpu_labels = {**labels, "gpu": gpu_id}
+            metrics.info("beszel_gpu_info", {**gpu_labels, "name": gpu.get("n", "")})
             metrics.add("beszel_gpu_usage_percent", gpu.get("u"), gpu_labels)
             metrics.add("beszel_gpu_memory_used_bytes", mib_to_bytes(gpu.get("mu")), gpu_labels)
             metrics.add("beszel_gpu_memory_total_bytes", mib_to_bytes(gpu.get("mt")), gpu_labels)
@@ -1039,7 +1040,21 @@ class BeszelCollector:
                 continue
             metrics.add("beszel_smart_capacity_bytes", device.get("capacity"), data_labels)
             metrics.add("beszel_smart_temperature_celsius", device.get("temp"), data_labels)
-            metrics.add("beszel_smart_power_on_hours_total", device.get("hours"), data_labels, metric_type="counter")
+            power_on_hours = numeric(device.get("hours"))
+            if power_on_hours is not None:
+                metrics.add(
+                    "beszel_smart_power_on_seconds_total",
+                    float(power_on_hours) * 3600,
+                    data_labels,
+                    metric_type="counter",
+                )
+                if LEGACY_UNITS:
+                    metrics.add(
+                        "beszel_smart_power_on_hours_total",
+                        power_on_hours,
+                        data_labels,
+                        metric_type="counter",
+                    )
             metrics.add("beszel_smart_power_cycles_total", device.get("cycles"), data_labels, metric_type="counter")
             state = str(device.get("state", "")).upper()
             if state:
@@ -1071,15 +1086,25 @@ class BeszelCollector:
             service_labels = {**labels, "service": service.get("name", "")}
             state_value = numeric(service.get("state"))
             substate_value = numeric(service.get("sub"))
-            state = int(state_value) if state_value is not None else 1
-            substate = int(substate_value) if substate_value is not None else 4
-            state_text = states[state] if 0 <= state < len(states) else "unknown"
+            state = (
+                int(state_value)
+                if state_value is not None and float(state_value).is_integer()
+                else -1
+            )
+            substate = (
+                int(substate_value)
+                if substate_value is not None and float(substate_value).is_integer()
+                else -1
+            )
+            state_known = 0 <= state < len(states)
+            state_text = states[state] if state_known else "unknown"
             substate_text = substates[substate] if 0 <= substate < len(substates) else "unknown"
             metrics.info("beszel_systemd_service_info", {**service_labels, "state": state_text, "substate": substate_text})
             if not emit_dynamic:
                 continue
-            metrics.add("beszel_systemd_service_active", 1 if state == 0 else 0, service_labels)
-            metrics.add("beszel_systemd_service_failed", 1 if state == 2 else 0, service_labels)
+            if state_known:
+                metrics.add("beszel_systemd_service_active", 1 if state == 0 else 0, service_labels)
+                metrics.add("beszel_systemd_service_failed", 1 if state == 2 else 0, service_labels)
             metrics.add("beszel_systemd_service_cpu_usage_percent", service.get("cpu"), service_labels)
             metrics.add("beszel_systemd_service_cpu_peak_percent", service.get("cpuPeak"), service_labels)
             metrics.add("beszel_systemd_service_memory_bytes", service.get("memory"), service_labels)

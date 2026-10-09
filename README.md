@@ -220,6 +220,14 @@ Expected response:
 {"status":"ok"}
 ```
 
+**Important:** `/healthz` is a *process liveness* endpoint, not a Hub
+readiness check. It returns `{"status":"ok"}` even if authentication to Beszel
+fails, the Hub is unavailable, or the last collection exceeded its deadline.
+Docker HEALTHCHECK uses this endpoint to confirm the exporter process responds.
+To monitor upstream availability and data collection, alert on
+`beszel_exporter_up == 0` and the age of
+`beszel_exporter_last_success_timestamp_seconds` from `/metrics`.
+
 Metrics:
 
 ```bash
@@ -360,7 +368,11 @@ Older Beszel rate fields expressed in MiB/s are converted to bytes/s when newer 
 LEGACY_UNITS=true
 ```
 
-The same flag temporarily restores deprecated `*_await_milliseconds` series while the default metrics use `*_await_seconds`.
+The same flag temporarily restores deprecated `*_await_milliseconds` and
+`beszel_smart_power_on_hours_total` series. The default SMART power-on lifetime
+counter is `beszel_smart_power_on_seconds_total` (Beszel's `hours` field
+multiplied by 3600). Existing queries for `*_hours_total` should migrate to
+the new name or opt in to `LEGACY_UNITS=true` temporarily.
 
 ### Label cardinality
 
@@ -475,7 +487,42 @@ current
 
 Numeric SMART series do not include `model` or `firmware` labels. Those fields are present only on `beszel_smart_device_info`, preventing a firmware upgrade from creating new copies of every SMART attribute time series.
 
+SMART power-on time is exported as seconds (`beszel_smart_power_on_seconds_total`).
+The former hours-based series is optional under `LEGACY_UNITS=true`.
+
 SMART raw human-readable strings are not exported as labels.
+
+## GPU metrics
+
+GPU numeric series (`beszel_gpu_usage_percent`,
+`beszel_gpu_memory_used_bytes`, `beszel_gpu_memory_total_bytes`,
+`beszel_gpu_power_watts`, `beszel_gpu_package_power_watts`, and
+`beszel_gpu_engine_usage_percent`) use stable `system`, `system_id`,
+`gpu` labels (plus `engine` for per-engine usage).
+The descriptive Beszel GPU name/model field `g[*].n` is exported only on
+`beszel_gpu_info{gpu="...",name="..."}`, not on numeric series.
+Queries that used `name` on numeric GPU metrics must join the info series
+or display the GPU identifier instead.
+
+## ZFS / Btrfs pool metrics
+
+Two **distinct source representations** are intentionally exposed; they
+should not be treated as interchangeable or summed together:
+
+| Metric family | Beszel source | Fields and unit handling |
+| --- | --- | --- |
+| `beszel_storage_pool_total_bytes`, `beszel_storage_pool_used_bytes` | Recent `system_stats.stats.z` | `d` and `du` values supplied in GiB; converted to bytes |
+| `beszel_storage_pool_read_bytes_per_second`, `beszel_storage_pool_write_bytes_per_second` | Recent `system_stats.stats.z` | `rb`, `wb` rates, already in bytes/s |
+| `beszel_storage_pool_size_bytes`, `beszel_storage_pool_allocated_bytes`, `beszel_storage_pool_free_bytes` | `zfs_pools` collection | `size`, `alloc`, `free` values used directly, expected in bytes |
+| `beszel_storage_pool_vdev_*`, `beszel_storage_pool_dataset_*`, `beszel_storage_pool_scrub_*` | `zfs_pools` collection | Vdev errors, dataset sizes and scrub state |
+
+`total_bytes` and `size_bytes` can look similar but may represent
+different source updates and accounting semantics. Use one source consistently
+in a dashboard; for pool capacity use `size_bytes`, `allocated_bytes` and
+`free_bytes` together, and prefer the `stats.z` series for live I/O.
+`zfs_pools` collection sizes are not implicitly recomputed from
+`system_stats`, and missing optional collection data does not suppress
+fresh `stats.z` samples.
 
 ## Duplicate sample handling
 
@@ -521,6 +568,9 @@ beszel_exporter_dropped_samples_total
 | Always exported `*_mib_per_second` | disabled by default; byte/second metrics are preferred |
 | `beszel_container_network_bytes_per_second{direction="total"}` | replaced by `beszel_container_network_combined_bytes_per_second` |
 | SMART `model` / `firmware` on every numeric series | metadata moved to `beszel_smart_device_info` |
+| `beszel_smart_power_on_hours_total` | `beszel_smart_power_on_seconds_total` by default; hours series requires `LEGACY_UNITS=true` |
+| GPU `name` model label on numeric metrics | model moved to `beszel_gpu_info`; numeric series keyed by stable GPU identifier |
+| Missing / invalid systemd `state` treated as inactive | `state="unknown"`; omit active/failed gauges until state is known |
 | `beszel_network_monitor_tls_cert_days_remaining` | calculate from expiry timestamp in PromQL |
 | Persistent last host values exported indefinitely | stale dynamic metrics are suppressed |
 | Raw container status like `Up 2 hours` on `beszel_container_info` | normalized to bounded lifecycle states such as `running` or `exited` |
