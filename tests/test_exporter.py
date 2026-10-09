@@ -121,6 +121,32 @@ def test_bulk_history_cutoff_includes_boundary_and_excludes_older():
     assert set(found) == {"fresh"}
 
 
+def test_fresh_scan_page_limit_warns_only_if_unresolved_ids(monkeypatch, caplog):
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "BULK_PAGE_SIZE", 2)
+    monkeypatch.setattr(exporter, "BULK_MAX_PAGES", 1)
+    api = TimeFilteredAPI([
+        {"system": "a", "created": "2026-10-05T11:59:50Z"},
+        {"system": "b", "created": "2026-10-05T11:59:40Z"},
+    ])
+    found = api.latest_by_relation(
+        "system_stats", "system", {"a", "b"}, fields="system,created,type",
+        min_created=now - 180,
+    )
+    assert set(found) == {"a", "b"}
+    assert len(api.calls) == 1
+    assert not any(record.levelname == "WARNING" for record in caplog.records)
+
+    api.calls.clear()
+    found = api.latest_by_relation(
+        "system_stats", "system", {"a", "b", "c"}, fields="system,created,type",
+        min_created=now - 180,
+    )
+    assert set(found) == {"a", "b"}
+    assert len(api.calls) == 1
+    assert any("reached page limit" in record.message for record in caplog.records)
+
+
 def test_json_decoding_accepts_objects_and_strings():
     value = {"x": [1, 2]}
     assert exporter.decoded(value, {}) == value
