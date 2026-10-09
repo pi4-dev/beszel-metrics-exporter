@@ -290,7 +290,7 @@ def test_container_info_status_does_not_change_with_uptime(monkeypatch):
 
 def test_systemd_info_unknown_numeric_codes_are_bounded():
     metrics = exporter.PrometheusText()
-    exporter.BeszelCollector.emit_systemd_services(
+    exporter.BeszelCollector.emit_systemd(
         metrics,
         {"system": "source-a", "system_id": "sys1"},
         [{"name": "x.service", "state": 12345, "sub": 98765}],
