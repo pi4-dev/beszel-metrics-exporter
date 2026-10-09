@@ -67,7 +67,7 @@ jobs:
             sleep 1
           done
           curl -fsS http://127.0.0.1:9105/healthz
-          curl -fsS http://127.0.0.1:9105/metrics | grep '^beszel_exporter_up 0
+          curl -fsS http://127.0.0.1:9105/metrics | grep '^beszel_exporter_up 0$'
 
           # Docker's HEALTHCHECK runs in the container (not via the host port).
           # With a 30s interval it normally becomes healthy within ~40 seconds.
