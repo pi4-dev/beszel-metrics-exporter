@@ -41,7 +41,8 @@ jobs:
           # A legacy .env must not override the project-specific runtime settings.
           printf 'BESZEL_URL=http://ignored-legacy:8090\n' > .env
           docker compose config --quiet
-          docker compose config --format json | python -c 'import json,sys; s=json.load(sys.stdin)["services"]["beszel-metrics-exporter"]; assert s["environment"]["BESZEL_URL"] == "http://beszel:8090"; assert s["env_file"][0].endswith("/beszel-metrics-exporter.env"); assert any(p.get("host_ip") == "127.0.0.1" and p.get("published") == "9105" for p in s["ports"])'
+          grep -Fx '    env_file: beszel-metrics-exporter.env' docker-compose.yaml
+          docker compose config --format json | python -c 'import json,sys; s=json.load(sys.stdin)["services"]["beszel-metrics-exporter"]; assert s["environment"]["BESZEL_URL"] == "http://beszel:8090"; assert any(p.get("host_ip") == "127.0.0.1" and p.get("published") == "9105" for p in s["ports"])'
           for f in .env beszel-metrics-exporter.env docker-compose.override.yaml; do git check-ignore -q "$f"; done
           cat > docker-compose.override.yaml <<'YAML'
           services:
