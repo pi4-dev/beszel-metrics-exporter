@@ -323,6 +323,29 @@ while numeric SMART metrics carry only stable device identity labels such as `de
 
 Container image, container ID, status and port strings are similarly restricted to `beszel_container_info`.
 
+### Lifecycle metadata label cardinality
+
+Beszel stores Docker container status as **display text** (for example
+`Up 2 minutes`, `Up 3 hours`, or `Exited (137) 20 seconds ago`). Passing that
+text directly as a Prometheus label creates a new time series whenever the
+uptime changes.
+
+`beszel_container_info{status="..."}` now uses bounded lifecycle states:
+`running`, `exited`, `restarting`, `paused`, `created`, `dead`, `removing`,
+or `unknown`. A Docker health suffix (such as `(healthy)` or `(unhealthy)`)
+does not change the lifecycle status; `beszel_container_health_state` provides
+the separate numerical health signal. Unrecognized status strings become
+`unknown` rather than arbitrary new label values.
+
+`beszel_system_info.status` uses only `up`, `down`, `paused`, `pending`, or
+`unknown`. `beszel_systemd_service_info` uses enumerated `state`/`substate`
+labels with `unknown` for unmapped codes; state transitions may create a
+bounded number of additional series but cannot include arbitrary uptime text.
+
+**Compatibility:** dashboards filtering for `status=~"Up.*"` or exact
+`status="Up ..."` values must switch to `status="running"`. Historical
+raw-status series remain in the metrics backend until its configured
+retention expires; this update prevents new uptime-derived series.
 ## Container network metrics
 
 TX/RX use:
@@ -422,6 +445,7 @@ beszel_exporter_collection_errors_total{collection="..."}
 | SMART `model` / `firmware` on every numeric series | metadata moved to `beszel_smart_device_info` |
 | `beszel_network_monitor_tls_cert_days_remaining` | calculate from expiry timestamp in PromQL |
 | Persistent last host values exported indefinitely | stale dynamic metrics are suppressed |
+| Raw container status like `Up 2 hours` on `beszel_container_info` | normalized to bounded lifecycle states such as `running` or `exited` |
 
 ## Metric exposition format
 

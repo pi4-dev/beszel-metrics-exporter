@@ -73,6 +73,35 @@ def decoded(value: Any, default: Any) -> Any:
     return default
 
 
+def normalized_container_status(value: Any) -> str:
+    """Collapse Docker uptime text into a fixed set of lifecycle states."""
+    if not isinstance(value, str):
+        return "unknown"
+    status = value.strip().lower()
+    # Docker Status is display text: "Up 3 hours (healthy)", not a stable state.
+    # Check paused first because Docker represents it as "Up ... (Paused)".
+    if status.startswith("up ") or status == "up":
+        return "paused" if "(paused)" in status else "running"
+    for prefix, state in (
+        ("running", "running"),
+        ("exited", "exited"),
+        ("stopped", "exited"),
+        ("restarting", "restarting"),
+        ("paused", "paused"),
+        ("created", "created"),
+        ("dead", "dead"),
+        ("removing", "removing"),
+        ("removal in progress", "removing"),
+    ):
+        if status == prefix or status.startswith(prefix + " ") or status.startswith(prefix + " ("):
+            return state
+    return "unknown"
+
+
+def normalized_system_status(value: Any) -> str:
+    """Allow only the four documented Beszel Hub system states."""
+    return value if value in ("up", "down", "paused", "pending") else "unknown"
+
 def escape_label(value: Any) -> str:
     return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
@@ -545,7 +574,7 @@ class BeszelCollector:
             "beszel_system_info",
             {
                 **labels,
-                "status": system.get("status", ""),
+                "status": normalized_system_status(system.get("status")),
                 "agent_version": info.get("v", system.get("v", "")),
                 "hostname": details.get("hostname", info.get("h", "")),
                 "kernel": details.get("kernel", info.get("k", "")),
@@ -830,7 +859,7 @@ class BeszelCollector:
                     **series_labels,
                     "container_id": container.get("id", ""),
                     "image": container.get("image", ""),
-                    "status": container.get("status", ""),
+                    "status": normalized_container_status(container.get("status")),
                     "ports": container.get("ports", ""),
                 },
             )
@@ -914,8 +943,8 @@ class BeszelCollector:
             substate_value = numeric(service.get("sub"))
             state = int(state_value) if state_value is not None else 1
             substate = int(substate_value) if substate_value is not None else 4
-            state_text = states[state] if 0 <= state < len(states) else str(state)
-            substate_text = substates[substate] if 0 <= substate < len(substates) else str(substate)
+            state_text = states[state] if 0 <= state < len(states) else "unknown"
+            substate_text = substates[substate] if 0 <= substate < len(substates) else "unknown"
             metrics.info("beszel_systemd_service_info", {**service_labels, "state": state_text, "substate": substate_text})
             if not emit_dynamic:
                 continue

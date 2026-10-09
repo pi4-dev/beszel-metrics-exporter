@@ -103,6 +103,40 @@ def test_prometheus_text_rejects_duplicate_series():
         metrics.add("duplicate_metric", 2, {"a": "x"})
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Up 2 minutes", "running"),
+        ("Up About an hour", "running"),
+        ("Up 3 hours (healthy)", "running"),
+        ("Up 3 hours (unhealthy)", "running"),
+        ("Up 4 hours (Paused)", "paused"),
+        ("Exited (0) 2 hours ago", "exited"),
+        ("Exited (137) 20 seconds ago", "exited"),
+        ("Restarting (1) 5 seconds ago", "restarting"),
+        ("Created", "created"),
+        ("Dead", "dead"),
+        ("Removing", "removing"),
+        ("Running", "running"),
+        ("", "unknown"),
+        (None, "unknown"),
+        ("Up 2 minutes; unique-value=123", "running"),
+        ("unexpected 123456", "unknown"),
+    ],
+)
+def test_normalized_container_status_is_bounded(raw, expected):
+    assert exporter.normalized_container_status(raw) == expected
+
+
+@pytest.mark.parametrize("value", ["up", "down", "paused", "pending"])
+def test_normalized_system_status_known_values(value):
+    assert exporter.normalized_system_status(value) == value
+
+
+@pytest.mark.parametrize("value", ["Up 3 minutes", "", None, "down 10s"])
+def test_normalized_system_status_unknown_values(value):
+    assert exporter.normalized_system_status(value) == "unknown"
+
 class FakeAPI:
     def __init__(self, now: float, stale: bool = False, fail_systems: bool = False):
         self.now = now
@@ -229,6 +263,44 @@ def test_fresh_stats_have_no_duplicate_fs_or_wifi_samples(monkeypatch):
     assert "beszel_system_disk_read_await_seconds" in text
     assert "beszel_system_disk_read_await_milliseconds" not in text
 
+
+def test_container_info_status_does_not_change_with_uptime(monkeypatch):
+    class StatusAPI(FakeAPI):
+        status = "Up 2 minutes"
+
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "containers":
+                rows[0]["status"] = self.status
+            return rows
+
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    api = StatusAPI(now)
+    collector = exporter.BeszelCollector(api=api, clock=lambda: now)
+    first = collector.collect()
+    api.status = "Up 3 hours (healthy)"
+    second = collector.collect()
+    info_line = lambda output: next(
+        line for line in output.splitlines() if line.startswith("beszel_container_info{")
+    )
+    assert info_line(first) == info_line(second)
+    assert 'status="running"' in info_line(second)
+    assert "3 hours" not in second
+
+
+def test_systemd_info_unknown_numeric_codes_are_bounded():
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_systemd_services(
+        metrics,
+        {"system": "source-a", "system_id": "sys1"},
+        [{"name": "x.service", "state": 12345, "sub": 98765}],
+        emit_dynamic=False,
+    )
+    result = metrics.render()
+    assert 'state="unknown"' in result
+    assert 'substate="unknown"' in result
+    assert "12345" not in result and "98765" not in result
 
 def test_container_network_total_is_separate_metric(monkeypatch):
     now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
