@@ -200,6 +200,7 @@ When `BESZEL_TOKEN` is set, username/password authentication is not used. Static
 git clone https://github.com/pi4-dev/beszel-metrics-exporter.git
 cd beszel-metrics-exporter
 cp beszel-metrics-exporter.env.example beszel-metrics-exporter.env
+chmod 600 beszel-metrics-exporter.env
 ```
 
 Edit `beszel-metrics-exporter.env`, then start:
@@ -245,6 +246,7 @@ First-time setup:
 
 ```bash
 cp beszel-metrics-exporter.env.example beszel-metrics-exporter.env
+chmod 600 beszel-metrics-exporter.env
 # Edit beszel-metrics-exporter.env to set the Beszel URL and credentials.
 docker compose up -d --build
 ```
@@ -344,6 +346,7 @@ This prevents dashboard variables from mixing label values from unrelated jobs.
 | `LISTEN_PORT` | `9105` | Gunicorn bind port |
 
 Unlike the initial implementation, `LISTEN_HOST` and `LISTEN_PORT` are used by both direct Python execution and the production Gunicorn container through `gunicorn.conf.py`.
+When using Docker Compose, the `environment:` values in `docker-compose.yaml` take precedence over `env_file:`, so change `LISTEN_HOST` and `LISTEN_PORT` in `docker-compose.override.yaml` and update `ports:` there as needed (editing only `beszel-metrics-exporter.env` will not change them).
 
 ## Metric conventions
 
