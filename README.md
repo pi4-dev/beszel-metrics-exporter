@@ -424,6 +424,30 @@ Numeric SMART series do not include `model` or `firmware` labels. Those fields a
 
 SMART raw human-readable strings are not exported as labels.
 
+## Duplicate sample handling
+
+A repeated Prometheus series (the same metric name and label set), such as two
+container records with the same name, a `bats.primary` and `bat` value in one
+system, or duplicate ZFS dataset entries, no longer aborts the entire collection.
+The exporter retains the **first emitted value**, drops subsequent duplicates,
+and logs a warning once per metric family per collection (not once per drop).
+It never logs the potentially sensitive label values in these warnings.
+
+`beszel_exporter_dropped_samples_total` is a **cumulative counter** of all
+dropped duplicates since the exporter process started. It increments only when
+a new collection runs; responses served from `CACHE_TTL` or
+`FAILURE_CACHE_TTL` do not increment it again. Even if a separate later error
+forces last-good-snapshot fallback, the cumulative counter is retained.
+
+This counter has no labels, avoiding a second cardinality problem. The
+following PromQL shows the number of drops over a period:
+
+```promql
+increase(beszel_exporter_dropped_samples_total[1h])
+```
+
+A non-zero result means source data or exporter label mapping should be
+investigated: conflicting data is *discarded*, not merged or summed.
 ## Exporter self-monitoring
 
 ```text
@@ -431,6 +455,7 @@ beszel_exporter_up
 beszel_exporter_scrape_duration_seconds
 beszel_exporter_last_success_timestamp_seconds
 beszel_exporter_collection_errors_total{collection="..."}
+beszel_exporter_dropped_samples_total
 ```
 
 `beszel_exporter_collection_errors_total` increments when an optional Beszel collection cannot be read. Detailed causes are written to exporter logs.

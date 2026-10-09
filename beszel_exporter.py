@@ -166,8 +166,11 @@ def record_age_seconds(record: dict[str, Any] | None, now: float | None = None) 
 class PrometheusText:
     """Build valid Prometheus text exposition with contiguous metric families."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_duplicate: Callable[[str], None] | None = None) -> None:
         self.families: dict[str, dict[str, Any]] = {}
+        self.dropped_samples = 0
+        self._logged_duplicates: set[str] = set()
+        self._on_duplicate = on_duplicate
 
     def add(
         self,
@@ -194,7 +197,15 @@ class PrometheusText:
             raise ValueError(f"Metric type conflict for {name}")
         key = tuple(sorted((str(k), str(v)) for k, v in labels.items() if v is not None))
         if key in family["keys"]:
-            raise ValueError(f"Duplicate sample for {name} labels={dict(key)}")
+            # A single malformed/repeated source record must not abort all hosts.
+            # Warn once per metric per collection to avoid flooding logs; count every drop.
+            self.dropped_samples += 1
+            if name not in self._logged_duplicates:
+                logger.warning("Dropping duplicate Prometheus sample for metric %s", name)
+                self._logged_duplicates.add(name)
+            if self._on_duplicate is not None:
+                self._on_duplicate(name)
+            return
         family["keys"].add(key)
         family["samples"].append((value, labels))
 
@@ -351,6 +362,12 @@ class BeszelCollector:
         self.last_good_data = ""
         self.last_success = 0.0
         self.collection_errors: defaultdict[str, int] = defaultdict(int)
+        self.dropped_samples_total = 0
+
+    def _record_dropped_sample(self, _metric_name: str) -> None:
+        # Invoked while collect() holds the collector lock. Counts persist across scrapes,
+        # including an attempt that subsequently fails for an unrelated reason.
+        self.dropped_samples_total += 1
 
     def optional_records(self, collection: str, **kwargs: Any) -> list[dict[str, Any]]:
         try:
@@ -423,10 +440,16 @@ class BeszelCollector:
                 metric_type="counter",
                 help_text="Total optional Beszel collection read errors.",
             )
+        metrics.add(
+            "beszel_exporter_dropped_samples_total",
+            self.dropped_samples_total,
+            metric_type="counter",
+            help_text="Total samples omitted because metric name and label set were duplicated.",
+        )
         return data + metrics.render()
 
     def _collect_data(self, now: float) -> str:
-        metrics = PrometheusText()
+        metrics = PrometheusText(on_duplicate=self._record_dropped_sample)
         systems = self.api.records("systems")
         system_ids = {row.get("id") for row in systems if row.get("id")}
 

@@ -96,11 +96,28 @@ def test_prometheus_text_groups_families_and_emits_help():
     assert bar_help > foo_type + 2
 
 
-def test_prometheus_text_rejects_duplicate_series():
-    metrics = exporter.PrometheusText()
+def test_prometheus_text_drops_duplicate_series_but_preserves_first(caplog):
+    duplicate_metrics = []
+    metrics = exporter.PrometheusText(on_duplicate=duplicate_metrics.append)
     metrics.add("duplicate_metric", 1, {"a": "x"})
-    with pytest.raises(ValueError, match="Duplicate sample"):
-        metrics.add("duplicate_metric", 2, {"a": "x"})
+    metrics.add("duplicate_metric", 2, {"a": "x"})
+    metrics.add("duplicate_metric", 3, {"a": "x"})
+    metrics.add("other_metric", 4, {"a": "x"})
+    lines = metrics.render().splitlines()
+    assert [line for line in lines if line.startswith("duplicate_metric{")] == ['duplicate_metric{a="x"} 1']
+    assert 'other_metric{a="x"} 4' in lines
+    assert metrics.dropped_samples == 2
+    assert duplicate_metrics == ["duplicate_metric", "duplicate_metric"]
+    warnings = [record for record in caplog.records if "Dropping duplicate Prometheus sample" in record.message]
+    assert len(warnings) == 1
+    assert "duplicate_metric" in warnings[0].message
+
+
+def test_prometheus_text_still_rejects_metric_type_conflicts():
+    metrics = exporter.PrometheusText()
+    metrics.add("my_metric", 1, metric_type="gauge")
+    with pytest.raises(ValueError, match="Metric type conflict"):
+        metrics.add("my_metric", 2, metric_type="counter")
 
 
 @pytest.mark.parametrize(
@@ -323,6 +340,71 @@ def test_smart_metadata_only_on_info(monkeypatch):
     assert 'serial="SERIAL"' in temp
     assert 'model="Disk"' in info and 'firmware="1.0"' in info
 
+
+def test_duplicate_source_samples_are_isolated_and_counted(monkeypatch):
+    class DuplicateAPI(FakeAPI):
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "containers":
+                # Different IDs, but the numeric metrics use the same container name.
+                rows.append({"id": "cid-other", "system": "sys1", "name": "app", "cpu": 99, "memory": 20})
+            if collection == "zfs_pools":
+                return [{"system": "sys1", "name": "pool", "datasets": [
+                    {"name": "ds", "mount": "/mnt/ds", "used": 12, "avail": 20},
+                    {"name": "ds", "mount": "/mnt/ds", "used": 99, "avail": 90},
+                ]}]
+            return rows
+
+        def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
+            records = super().latest_by_relation(collection, relation_field, wanted_ids, **kwargs)
+            if collection == "system_stats":
+                stats = records["sys1"]["stats"]
+                stats["bats"] = {"primary": 80}
+                stats["bat"] = [40, 1]
+            return records
+
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    api = DuplicateAPI(now)
+    collector = exporter.BeszelCollector(api=api, clock=lambda: now)
+    first = collector.collect()
+    assert "beszel_exporter_up 1" in first
+    assert "beszel_system_info" in first
+    assert "beszel_container_info" in first
+    assert "beszel_systemd_service_info" in first
+    assert 'beszel_system_battery_percent{battery="primary",system="source-a",system_id="sys1"} 80' in first
+    assert 'beszel_container_cpu_usage_percent{container="app",system="source-a",system_id="sys1"} 3' in first
+    assert 'beszel_storage_pool_dataset_used_bytes{dataset="ds",mount="/mnt/ds",pool="pool",system="source-a",system_id="sys1"} 12' in first
+    dropped_first = collector.dropped_samples_total
+    assert dropped_first >= 4
+    assert f"beszel_exporter_dropped_samples_total {dropped_first}" in first
+    assert "# TYPE beszel_exporter_dropped_samples_total counter" in first
+    second = collector.collect()
+    assert collector.dropped_samples_total == 2 * dropped_first
+    assert f"beszel_exporter_dropped_samples_total {2 * dropped_first}" in second
+    assert "beszel_exporter_up 1" in second
+
+
+def test_duplicate_count_survives_unrelated_hub_outage(monkeypatch):
+    class DuplicateContainerAPI(FakeAPI):
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "containers":
+                rows.append({"id": "other", "system": "sys1", "name": "app", "cpu": 123})
+            return rows
+
+    now = [datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()]
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    api = DuplicateContainerAPI(now[0])
+    collector = exporter.BeszelCollector(api=api, clock=lambda: now[0])
+    assert "beszel_exporter_up 1" in collector.collect()
+    prior = collector.dropped_samples_total
+    assert prior > 0
+    api.fail_systems = True
+    now[0] += 1
+    failed = collector.collect()
+    assert "beszel_exporter_up 0" in failed
+    assert f"beszel_exporter_dropped_samples_total {prior}" in failed
 
 def test_failure_uses_negative_cache_and_does_not_leak_error(monkeypatch):
     now = [datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()]
