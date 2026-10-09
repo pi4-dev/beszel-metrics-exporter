@@ -53,9 +53,6 @@ jobs:
           docker compose config --quiet
           docker compose config --format json | python -c 'import json,sys; s=json.load(sys.stdin)["services"]["beszel-metrics-exporter"]; assert s["environment"]["COMPOSE_OVERRIDE_TEST"] == "enabled"; assert s["environment"]["BESZEL_URL"] == "http://beszel:8090"; assert any(p.get("host_ip") == "127.0.0.1" and p.get("published") == "9105" for p in s["ports"])'
 
-      - name: Validate Prometheus exposition
-        run: docker run --rm -i --entrypoint /bin/promtool prom/prometheus:v3.15.0 check metrics < /tmp/beszel.metrics
-
       - name: Build container
         run: docker build -t beszel-metrics-exporter:test .
 
@@ -70,4 +67,23 @@ jobs:
             sleep 1
           done
           curl -fsS http://127.0.0.1:9105/healthz
-          curl -fsS http://127.0.0.1:9105/metrics | grep '^beszel_exporter_up 0$'
+          curl -fsS http://127.0.0.1:9105/metrics | grep '^beszel_exporter_up 0
+
+          # Docker's HEALTHCHECK runs in the container (not via the host port).
+          # With a 30s interval it normally becomes healthy within ~40 seconds.
+          health_status=starting
+          for i in $(seq 1 30); do
+            health_status="$(docker inspect --format '{{.State.Health.Status}}' beszel-metrics-exporter-test)"
+            echo "Container HEALTHCHECK status: $health_status"
+            if [ "$health_status" = "healthy" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$health_status" != "healthy" ]; then
+            docker inspect --format '{{json .State.Health}}' beszel-metrics-exporter-test
+            exit 1
+          fi
+
+      - name: Validate Prometheus exposition
+        run: docker run --rm -i --entrypoint /bin/promtool prom/prometheus:v3.15.0 check metrics < /tmp/beszel.metrics
