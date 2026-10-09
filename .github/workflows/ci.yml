@@ -35,9 +35,6 @@ jobs:
       - name: Render mocked metrics
         run: PYTHONPATH=.:tests python tests/render_mock_metrics.py > /tmp/beszel.metrics
 
-      - name: Validate Prometheus exposition
-        run: docker run --rm -i --entrypoint /bin/promtool prom/prometheus:v3.15.0 check metrics < /tmp/beszel.metrics
-
       - name: Validate Compose env and automatic override
         run: |
           cp .env.example .env
@@ -50,6 +47,9 @@ jobs:
           YAML
           docker compose config --quiet
           docker compose config --format json | python -c 'import json,sys; s=json.load(sys.stdin)["services"]["beszel-metrics-exporter"]; assert s["environment"]["COMPOSE_OVERRIDE_TEST"] == "enabled"; assert s["environment"]["BESZEL_URL"] == "http://beszel:8090"; assert any(p.get("host_ip") == "127.0.0.1" and p.get("published") == "9105" for p in s["ports"])'
+
+      - name: Validate Prometheus exposition
+        run: docker run --rm -i --entrypoint /bin/promtool prom/prometheus:v3.15.0 check metrics < /tmp/beszel.metrics
 
       - name: Build container
         run: docker build -t beszel-metrics-exporter:test .
