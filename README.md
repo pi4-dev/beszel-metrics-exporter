@@ -147,10 +147,10 @@ When `BESZEL_TOKEN` is set, username/password authentication is not used. Static
 ```bash
 git clone https://github.com/pi4-dev/beszel-metrics-exporter.git
 cd beszel-metrics-exporter
-cp .env.example .env
+cp beszel-metrics-exporter.env.example beszel-metrics-exporter.env
 ```
 
-Edit `.env`, then start:
+Edit `beszel-metrics-exporter.env`, then start:
 
 ```bash
 docker compose up -d --build
@@ -176,43 +176,48 @@ curl -s http://127.0.0.1:9105/metrics | less
 
 ## Environment and local Docker Compose overrides
 
-`docker-compose.yaml` loads `.env` with `env_file: .env`, so Beszel credentials and
-exporter settings are passed to the **container**, not just used for Compose
-variable interpolation. Copy `.env.example` to `.env` and edit the values before
-the first deployment. `.env` is ignored by Git and excluded from Docker build context.
+`docker-compose.yaml` loads `beszel-metrics-exporter.env` using `env_file:`.
+This file contains the Beszel credentials and exporter runtime settings. Docker
+Compose passes them into the container without requiring an implicit `.env`
+file or a `--env-file` CLI option.
 
-`EXPORTER_PORT` in `.env` sets the host-side loopback port (default `9105`);
-the exporter continues listening on port `9105` inside the container.
-For example, `EXPORTER_PORT=19105` makes the endpoint available on
-`http://127.0.0.1:19105/metrics`.
+First-time setup:
 
-Create `docker-compose.override.yaml` next to `docker-compose.yaml` for
-machine-specific changes. Docker Compose automatically merges this file when
-running `docker compose up -d --build` from the project directory.
-The override files are intentionally Git-ignored and are not part of the image.
+```bash
+cp beszel-metrics-exporter.env.example beszel-metrics-exporter.env
+# Edit beszel-metrics-exporter.env to set the Beszel URL and credentials.
+docker compose up -d --build
+```
 
-Example: connect the exporter to a pre-existing monitoring network:
+If upgrading an existing deployment that used `.env`, move the existing values
+once, before starting the new Compose configuration:
+
+```bash
+mv .env beszel-metrics-exporter.env
+```
+
+Both `.env` and `beszel-metrics-exporter.env` are Git-ignored and excluded from the Docker
+build context. The legacy `.env` file is no longer used by the exporter's
+`env_file` directive. Docker Compose may still automatically read a local
+`.env` for its own interpolation if one exists; the supplied base Compose file
+does not depend on it.
+
+Create `docker-compose.override.yaml` alongside `docker-compose.yaml` for
+machine-specific settings; Docker Compose merges it automatically when you run
+`docker compose up -d --build`. Override files are Git-ignored.
+
+For example, change the host port to `19105` with Docker Compose 2.24.4+:
 
 ```yaml
 services:
   beszel-metrics-exporter:
-    networks:
-      - monitoring
-
-networks:
-  monitoring:
-    external: true
+    ports: !override
+      - "127.0.0.1:19105:9105"
 ```
 
-Use this network only if it can also reach the configured Beszel Hub.
-
-For changing the published port, prefer `EXPORTER_PORT` in `.env`.
-Adding another `ports:` entry in a Compose override can retain the original
-mapping as well. To replace the complete port list instead, Docker Compose
-2.24.4+ supports `ports: !override`.
-
-Existing deployments that already have a `.env` file can keep it without
-changing any Beszel credentials.
+The `!override` tag replaces the original port mapping rather than exposing
+both ports. You can also use an override to join a pre-existing monitoring
+network, provided that network can reach the Beszel Hub.
 
 ## Network exposure
 
@@ -276,7 +281,6 @@ This prevents dashboard variables from mixing label values from unrelated jobs.
 | `LOG_LEVEL` | `INFO` | Python log level |
 | `LISTEN_HOST` | `0.0.0.0` | Gunicorn bind address |
 | `LISTEN_PORT` | `9105` | Gunicorn bind port |
-| `EXPORTER_PORT` | `9105` | Host loopback port in the supplied Compose file |
 
 Unlike the initial implementation, `LISTEN_HOST` and `LISTEN_PORT` are used by both direct Python execution and the production Gunicorn container through `gunicorn.conf.py`.
 
@@ -502,7 +506,7 @@ Runtime dependencies are pinned in `requirements.lock`; development tools are pi
 
 ```text
 .
-├── .env.example
+├── beszel-metrics-exporter.env.example
 ├── .github/
 │   ├── dependabot.yml
 │   └── workflows/

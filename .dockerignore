@@ -1,6 +1,7 @@
 .git
 .github
 .env
+beszel-metrics-exporter.env
 __pycache__
 *.py[cod]
 .pytest_cache
