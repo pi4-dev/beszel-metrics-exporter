@@ -106,6 +106,33 @@ available to identify down hosts. If the Hub itself becomes unavailable,
 `beszel_system_up` is **not** replayed from cache: its last value no longer
 represents a verified host state.
 
+## Global scrape deadline
+
+The exporter uses one **monotonic, per-request time budget** (default
+`SCRAPE_BUDGET_SECONDS=15`), not a separate full timeout for every API call.
+Every Hub request (including login and retry after HTTP 401) receives a timeout
+bounded by the budget remaining and `REQUEST_TIMEOUT`. Pagination stops when
+the budget is exhausted; optional collection errors cannot silently suppress a
+deadline failure. The budget starts **before waiting for the collector lock**,
+so concurrent scrapes cannot each wait for a prior full scan and then run a new
+full scan.
+
+On deadline exhaustion, the scrape returns `beszel_exporter_up=0`, the
+last-known `*_info` metadata (when the collector lock was acquired), and
+exporter diagnostics. It never publishes partial results as successful or
+replays dynamic values. The usual `FAILURE_CACHE_TTL` reduces repeated Hub
+load, and the next attempt retries. If lock acquisition itself times out, only
+minimal exporter diagnostics are returned, without reading concurrent
+mutable collector state.
+
+Keep this budget below `scrape_timeout` (20 seconds in the supplied vmagent
+example); the default 15 seconds leaves ~5 seconds for HTTP response overhead.
+**Limitation:** the Python requests timeout is a socket connect/read inactivity
+limit rather than a strict total-response deadline. A server that continuously
+streams bytes slowly or CPU-heavy parsing can exceed the exact wall-clock
+limit inside a single operation; deadline checks stop subsequent work, but this
+is a cooperative rather than forcibly preemptive deadline.
+
 ## Hub failure behavior
 
 If the required `systems` request fails (or another error aborts the
@@ -296,6 +323,7 @@ This prevents dashboard variables from mixing label values from unrelated jobs.
 | `BESZEL_PASSWORD` | empty | Beszel password |
 | `BESZEL_TOKEN` | empty | Optional PocketBase auth token |
 | `REQUEST_TIMEOUT` | `10` | HTTP timeout per Hub request |
+| `SCRAPE_BUDGET_SECONDS` | `15` | Maximum collection budget (seconds), including collector-lock waiting and all Hub requests; keep below scraper timeout |
 | `CACHE_TTL` | `15` | Successful full-scrape cache TTL |
 | `FAILURE_CACHE_TTL` | `5` | Negative-cache TTL after a required Hub request fails |
 | `MAX_STATS_AGE_SECONDS` | `180` | Maximum age of dynamic host data |

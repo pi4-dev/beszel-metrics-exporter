@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import threading
+from contextvars import ContextVar
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -28,6 +29,9 @@ BESZEL_USER = os.getenv("BESZEL_USER", "")
 BESZEL_PASSWORD = os.getenv("BESZEL_PASSWORD", "")
 BESZEL_TOKEN = os.getenv("BESZEL_TOKEN", "")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10"))
+SCRAPE_BUDGET_SECONDS = float(os.getenv("SCRAPE_BUDGET_SECONDS", "15"))
+if not math.isfinite(SCRAPE_BUDGET_SECONDS) or SCRAPE_BUDGET_SECONDS <= 0:
+    raise ValueError("SCRAPE_BUDGET_SECONDS must be a finite positive number")
 CACHE_TTL = float(os.getenv("CACHE_TTL", "15"))
 FAILURE_CACHE_TTL = float(os.getenv("FAILURE_CACHE_TTL", "5"))
 MAX_STATS_AGE_SECONDS = float(os.getenv("MAX_STATS_AGE_SECONDS", "180"))
@@ -46,6 +50,31 @@ logging.basicConfig(
 logger = logging.getLogger("beszel_exporter")
 
 app = Flask(__name__)
+
+
+class ScrapeDeadlineExceeded(TimeoutError):
+    """The budget for one HTTP /metrics scrape was exhausted."""
+
+
+# A context-local deadline avoids leakage across Gunicorn gthread requests.
+_SCRAPE_DEADLINE: ContextVar[float | None] = ContextVar("beszel_scrape_deadline", default=None)
+
+
+def check_scrape_deadline() -> None:
+    deadline = _SCRAPE_DEADLINE.get()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise ScrapeDeadlineExceeded("Beszel collection time budget exhausted")
+
+
+def bounded_request_timeout() -> float:
+    """Limit each HTTP request to the remaining collection budget."""
+    deadline = _SCRAPE_DEADLINE.get()
+    if deadline is None:
+        return REQUEST_TIMEOUT
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ScrapeDeadlineExceeded("Beszel collection time budget exhausted")
+    return min(REQUEST_TIMEOUT, remaining)
 
 
 def numeric(value: Any) -> float | int | None:
@@ -248,23 +277,33 @@ class BeszelAPI:
         response = self.session.post(
             f"{BESZEL_URL}/api/collections/users/auth-with-password",
             json={"identity": BESZEL_USER, "password": BESZEL_PASSWORD},
-            timeout=REQUEST_TIMEOUT,
+            timeout=bounded_request_timeout(),
         )
+        check_scrape_deadline()
         response.raise_for_status()
         self.token = response.json()["token"]
         self.session.headers["Authorization"] = self.token
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        check_scrape_deadline()
         self.authenticate()
-        response = self.session.get(f"{BESZEL_URL}{path}", params=params, timeout=REQUEST_TIMEOUT)
+        response = self.session.get(
+            f"{BESZEL_URL}{path}", params=params, timeout=bounded_request_timeout()
+        )
+        check_scrape_deadline()
         if response.status_code == 401 and not BESZEL_TOKEN:
             logger.info("Beszel token rejected; re-authenticating")
             self.token = ""
             self.session.headers.pop("Authorization", None)
             self.authenticate()
-            response = self.session.get(f"{BESZEL_URL}{path}", params=params, timeout=REQUEST_TIMEOUT)
+            response = self.session.get(
+                f"{BESZEL_URL}{path}", params=params, timeout=bounded_request_timeout()
+            )
+            check_scrape_deadline()
         response.raise_for_status()
-        return response.json()
+        payload = response.json()
+        check_scrape_deadline()
+        return payload
 
     def records(
         self,
@@ -278,6 +317,7 @@ class BeszelAPI:
         page = 1
         result: list[dict[str, Any]] = []
         while True:
+            check_scrape_deadline()
             params: dict[str, Any] = {"page": page, "perPage": per_page}
             if fields:
                 params["fields"] = fields
@@ -337,6 +377,7 @@ class BeszelAPI:
         pending = set(wanted_ids)
         page = 1
         while pending and page <= BULK_MAX_PAGES:
+            check_scrape_deadline()
             params = {
                 "page": page,
                 "perPage": BULK_PAGE_SIZE,
@@ -348,6 +389,7 @@ class BeszelAPI:
             payload = self.get(f"/api/collections/{collection}/records", params=params)
             items = payload.get("items", [])
             for row in items:
+                check_scrape_deadline()
                 relation_id = row.get(relation_field)
                 if relation_id in pending:
                     found[relation_id] = row
@@ -386,8 +428,16 @@ class BeszelCollector:
 
     def optional_records(self, collection: str, **kwargs: Any) -> list[dict[str, Any]]:
         try:
-            return self.api.records(collection, **kwargs)
+            check_scrape_deadline()
+            records = self.api.records(collection, **kwargs)
+            check_scrape_deadline()
+            return records
+        except ScrapeDeadlineExceeded:
+            raise
         except Exception:
+            # Network timeouts near the budget boundary are scrape failures,
+            # not optional-data omissions.
+            check_scrape_deadline()
             self.collection_errors[collection] += 1
             logger.exception("Failed to read Beszel collection %s", collection)
             return []
@@ -402,41 +452,69 @@ class BeszelCollector:
         min_created: float,
     ) -> dict[str, dict[str, Any]]:
         try:
-            return self.api.latest_by_relation(
+            check_scrape_deadline()
+            records = self.api.latest_by_relation(
                 collection,
                 relation_field,
                 wanted_ids,
                 fields=fields,
                 min_created=min_created,
             )
+            check_scrape_deadline()
+            return records
+        except ScrapeDeadlineExceeded:
+            raise
         except Exception:
+            check_scrape_deadline()
             self.collection_errors[collection] += 1
             logger.exception("Failed to read latest Beszel records from %s", collection)
             return {}
 
     def collect(self) -> str:
-        now = self.clock()
-        with self.lock:
+        # Include lock contention in the per-request budget. A second scrape
+        # must not wait 15s for the first and then start its own 15s collection.
+        started = time.monotonic()
+        deadline = started + SCRAPE_BUDGET_SECONDS
+        if not self.lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            logger.warning("Beszel scrape deadline exceeded waiting for collector lock")
+            # The in-flight collector owns mutable state. Return only local
+            # diagnostics without reading its cache or unsafe shared dictionaries.
+            metrics = PrometheusText()
+            metrics.add("beszel_exporter_up", 0)
+            metrics.add("beszel_exporter_scrape_duration_seconds", time.monotonic() - started)
+            return metrics.render()
+        try:
+            now = self.clock()
             if self.cache and now - self.cache_time < self.cache_ttl:
                 return self.cache
-            started = self.clock()
+            token = _SCRAPE_DEADLINE.set(deadline)
             try:
+                check_scrape_deadline()
                 data, info_data = self._collect_data(now)
+                check_scrape_deadline()
                 self.last_good_info = info_data
                 self.last_success = self.clock()
-                body = self._with_self_metrics(data, 1, self.clock() - started)
+                body = self._with_self_metrics(data, 1, time.monotonic() - started)
                 ttl = CACHE_TTL
+            except ScrapeDeadlineExceeded:
+                logger.warning("Beszel scrape exceeded SCRAPE_BUDGET_SECONDS=%.1f", SCRAPE_BUDGET_SECONDS)
+                body = self._with_self_metrics(self.last_good_info, 0, time.monotonic() - started)
+                ttl = FAILURE_CACHE_TTL
             except Exception:
                 logger.exception("Beszel scrape failed")
                 # Never replay un-timestamped CPU, temperature, network, disk or host
                 # availability samples on an outage: Prometheus would record them
                 # as fresh at every subsequent scrape.
-                body = self._with_self_metrics(self.last_good_info, 0, self.clock() - started)
+                body = self._with_self_metrics(self.last_good_info, 0, time.monotonic() - started)
                 ttl = FAILURE_CACHE_TTL
+            finally:
+                _SCRAPE_DEADLINE.reset(token)
             self.cache = body
             self.cache_time = self.clock()
             self.cache_ttl = ttl
             return body
+        finally:
+            self.lock.release()
 
     def _with_self_metrics(self, data: str, up: int, duration: float) -> str:
         metrics = PrometheusText()
@@ -519,6 +597,7 @@ class BeszelCollector:
         )
 
         for system in systems:
+            check_scrape_deadline()
             system_id = system.get("id")
             if not system_id:
                 continue
@@ -569,7 +648,12 @@ class BeszelCollector:
                 stats_fresh,
                 now,
             )
-        return metrics.render(), metrics.render(info_only=True)
+        check_scrape_deadline()
+        full = metrics.render()
+        check_scrape_deadline()
+        metadata = metrics.render(info_only=True)
+        check_scrape_deadline()
+        return full, metadata
 
     @staticmethod
     def emit_pair(
