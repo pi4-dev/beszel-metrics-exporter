@@ -377,16 +377,28 @@ def test_collector_passes_independent_freshness_cutoffs_to_all_history_queries(m
     }
 
 def test_stale_stats_are_not_exported(monkeypatch):
+    class FilteredStaleAPI(FakeAPI):
+        def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
+            # Model the created >= cutoff query implemented by PocketBase.
+            rows = super().latest_by_relation(collection, relation_field, wanted_ids, **kwargs)
+            return {
+                key: record for key, record in rows.items()
+                if exporter.parse_timestamp(record["created"]) >= kwargs["min_created"]
+            }
+
     now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
     monkeypatch.setattr(exporter, "CACHE_TTL", 0)
-    collector = exporter.BeszelCollector(api=FakeAPI(now, stale=True), clock=lambda: now)
+    collector = exporter.BeszelCollector(api=FilteredStaleAPI(now, stale=True), clock=lambda: now)
     text = collector.collect()
-    assert "beszel_system_stats_age_seconds" in text
+    assert "beszel_system_stats_age_seconds" not in text
+    assert "beszel_container_stats_age_seconds" not in text
     assert "beszel_system_cpu_usage_percent" not in text
     assert "beszel_container_cpu_usage_percent" not in text
     assert "beszel_smart_temperature_celsius" not in text
     assert 'beszel_network_monitor_response_seconds{' not in text
     assert 'beszel_system_up{system="source-a",system_id="sys1"} 1' in text
+    system_info = next(line for line in text.splitlines() if line.startswith("beszel_system_info{"))
+    assert "status=" not in system_info
 
 
 def test_fresh_stats_have_no_duplicate_fs_or_wifi_samples(monkeypatch):
@@ -433,7 +445,7 @@ def test_systemd_info_unknown_numeric_codes_are_bounded():
         metrics,
         {"system": "source-a", "system_id": "sys1"},
         [{"name": "x.service", "state": 12345, "sub": 98765}],
-        emit_dynamic=False,
+        emit_dynamic=True,
     )
     result = metrics.render()
     assert 'state="unknown"' in result
@@ -736,3 +748,155 @@ def test_lock_wait_is_bounded_by_total_scrape_budget(monkeypatch):
         assert "beszel_exporter_scrape_duration_seconds" in response
     finally:
         collector.lock.release()
+
+
+def test_identity_only_render_strips_operational_labels_and_state_only_families():
+    metrics = exporter.PrometheusText()
+    sys = {"system": "alpha", "system_id": "sys1"}
+    metrics.info("beszel_system_info", {**sys, "status": "up", "hostname": "alpha", "kernel": "6.0"})
+    metrics.info(
+        "beszel_container_info",
+        {**sys, "container": "app", "container_id": "cid", "status": "running",
+         "image": "image:v1", "ports": "8080"},
+    )
+    metrics.info(
+        "beszel_smart_device_info",
+        {**sys, "device": "/dev/sda", "serial": "disk1", "state": "FAILED", "model": "Disk"},
+    )
+    metrics.info(
+        "beszel_systemd_service_info",
+        {**sys, "service": "sshd", "state": "failed", "substate": "dead"},
+    )
+    metrics.info(
+        "beszel_storage_pool_info",
+        {**sys, "pool": "tank", "pool_type": "zfs", "health": "DEGRADED"},
+    )
+    metrics.info(
+        "beszel_storage_pool_vdev_info",
+        {**sys, "pool": "tank", "vdev": "sda", "state": "FAULTED"},
+    )
+    metrics.info("beszel_storage_pool_health_info", {**sys, "pool": "tank", "health": "DEGRADED"})
+    metrics.info("beszel_storage_pool_scrub_info", {**sys, "pool": "tank", "state": "running"})
+    metrics.info("beszel_unknown_future_info", {**sys, "state": "BAD"})
+    metrics.add("beszel_system_cpu_usage_percent", 100, sys)
+
+    full = metrics.render()
+    assert 'state="failed"' in full and 'status="up"' in full
+    assert 'health="DEGRADED"' in full
+    fallback = metrics.render(identity_only=True)
+    assert 'beszel_system_info{hostname="alpha",system="alpha",system_id="sys1"} 1' in fallback
+    assert "beszel_container_info{" in fallback
+    assert "beszel_smart_device_info{" in fallback
+    assert "beszel_systemd_service_info{" in fallback
+    assert "beszel_storage_pool_info{" in fallback
+    assert "beszel_storage_pool_vdev_info{" in fallback
+    for name in (
+        "beszel_storage_pool_health_info",
+        "beszel_storage_pool_scrub_info",
+        "beszel_unknown_future_info",
+        "beszel_system_cpu_usage_percent",
+    ):
+        assert name not in fallback
+    for value in ('state="', 'status="', 'health="', 'substate="', 'ports="',
+                  'image="', 'model="', 'kernel="'):
+        assert value not in fallback
+
+
+def test_older_operational_info_not_replayed_when_hub_fails(monkeypatch):
+    class StateAPI(FakeAPI):
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "containers":
+                rows[0]["status"] = "Up 1 hour"
+                rows[0]["ports"] = "443/tcp"
+                rows[0]["image"] = "app:v1"
+            if collection == "smart_devices":
+                rows[0]["state"] = "PASSED"
+            if collection == "zfs_pools":
+                return [{
+                    "system": "sys1", "name": "tank", "health": "ONLINE",
+                    "scrub": {"state": "running", "progress": "45%"},
+                    "vdevs": [{"name": "sda", "state": "ONLINE"}],
+                }]
+            return rows
+
+        def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
+            rows = super().latest_by_relation(collection, relation_field, wanted_ids, **kwargs)
+            if collection == "system_stats":
+                rows["sys1"]["stats"]["z"] = {
+                    "tank": {"d": 10, "du": 5, "h": "ONLINE"}
+                }
+            return rows
+
+    now = [datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()]
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    api = StateAPI(now[0])
+    collector = exporter.BeszelCollector(api=api, clock=lambda: now[0])
+    good = collector.collect()
+    assert "beszel_exporter_up 1" in good
+    assert 'state="running"' in good
+    assert 'status="up"' in good
+    assert "beszel_storage_pool_health_info" in good
+    assert "beszel_storage_pool_scrub_info" in good
+
+    api.fail_systems = True
+    now[0] += 1
+    failed = collector.collect()
+    assert "beszel_exporter_up 0" in failed
+    assert "beszel_system_info" in failed
+    assert "beszel_container_info" in failed
+    assert "beszel_smart_device_info" in failed
+    assert "beszel_storage_pool_info" in failed
+    assert "beszel_storage_pool_vdev_info" in failed
+    assert "beszel_storage_pool_health_info" not in failed
+    assert "beszel_storage_pool_scrub_info" not in failed
+    for dynamic_label in ('state="', 'status="', 'substate="', 'health="', 'ports="'):
+        assert dynamic_label not in failed
+    assert "beszel_system_up" not in failed
+
+
+def test_unfresh_system_does_not_expose_saved_runtime_states():
+    m = exporter.PrometheusText()
+    labels = {"system": "alpha", "system_id": "sys1"}
+    exporter.BeszelCollector.emit_containers(
+        m, labels, [{"name": "app", "status": "Up 4 hours"}], [], emit_dynamic=False
+    )
+    exporter.BeszelCollector.emit_smart(
+        m, labels, [{"name": "/dev/sda", "serial": "d", "state": "FAILED"}],
+        emit_dynamic=False,
+    )
+    exporter.BeszelCollector.emit_systemd(
+        m, labels, [{"name": "x.service", "state": 2, "sub": 3}], emit_dynamic=False
+    )
+    exporter.BeszelCollector.emit_storage_pools(
+        m, labels, [{"name": "tank", "health": "DEGRADED"}], emit_dynamic=False
+    )
+    rendered = m.render()
+    for family in ("beszel_container_info", "beszel_smart_device_info",
+                   "beszel_systemd_service_info", "beszel_storage_pool_info"):
+        assert family in rendered
+    for field in ('status="', 'state="', 'health="', 'substate="'):
+        assert field not in rendered
+
+
+def test_duplicate_warning_once_per_metric_process_not_per_scrape(monkeypatch, caplog):
+    metric = "test_process_wide_warning_unique_family"
+    # Isolate this metric family without disabling the shared warning registry.
+    with exporter._LOGGED_DUPLICATE_METRICS_LOCK:
+        exporter._LOGGED_DUPLICATE_METRICS.discard(metric)
+    try:
+        total_drops = 0
+        for _ in range(3):
+            metrics = exporter.PrometheusText()
+            metrics.add(metric, 1, {"system": "a"})
+            metrics.add(metric, 2, {"system": "a"})
+            total_drops += metrics.dropped_samples
+        assert total_drops == 3
+        warnings = [
+            rec for rec in caplog.records
+            if "Dropping duplicate Prometheus sample" in rec.message and metric in rec.message
+        ]
+        assert len(warnings) == 1
+    finally:
+        with exporter._LOGGED_DUPLICATE_METRICS_LOCK:
+            exporter._LOGGED_DUPLICATE_METRICS.discard(metric)
