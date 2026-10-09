@@ -1,0 +1,25 @@
+services:
+  beszel-metrics-exporter:
+    build: .
+    container_name: beszel-metrics-exporter
+    restart: unless-stopped
+
+    # Load runtime settings and credentials from the same .env used by Compose.
+    env_file: .env
+
+    environment:
+      LISTEN_HOST: 0.0.0.0
+      LISTEN_PORT: "9105"
+
+    # Only accessible from the Docker host by default.
+    # EXPORTER_PORT is interpolated by Compose from .env.
+    ports:
+      - "127.0.0.1:${EXPORTER_PORT:-9105}:9105"
+
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

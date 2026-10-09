@@ -174,6 +174,46 @@ Metrics:
 curl -s http://127.0.0.1:9105/metrics | less
 ```
 
+## Environment and local Docker Compose overrides
+
+`docker-compose.yaml` loads `.env` with `env_file: .env`, so Beszel credentials and
+exporter settings are passed to the **container**, not just used for Compose
+variable interpolation. Copy `.env.example` to `.env` and edit the values before
+the first deployment. `.env` is ignored by Git and excluded from Docker build context.
+
+`EXPORTER_PORT` in `.env` sets the host-side loopback port (default `9105`);
+the exporter continues listening on port `9105` inside the container.
+For example, `EXPORTER_PORT=19105` makes the endpoint available on
+`http://127.0.0.1:19105/metrics`.
+
+Create `docker-compose.override.yaml` next to `docker-compose.yaml` for
+machine-specific changes. Docker Compose automatically merges this file when
+running `docker compose up -d --build` from the project directory.
+The override files are intentionally Git-ignored and are not part of the image.
+
+Example: connect the exporter to a pre-existing monitoring network:
+
+```yaml
+services:
+  beszel-metrics-exporter:
+    networks:
+      - monitoring
+
+networks:
+  monitoring:
+    external: true
+```
+
+Use this network only if it can also reach the configured Beszel Hub.
+
+For changing the published port, prefer `EXPORTER_PORT` in `.env`.
+Adding another `ports:` entry in a Compose override can retain the original
+mapping as well. To replace the complete port list instead, Docker Compose
+2.24.4+ supports `ports: !override`.
+
+Existing deployments that already have a `.env` file can keep it without
+changing any Beszel credentials.
+
 ## Network exposure
 
 The supplied Compose file publishes the exporter only on loopback:
@@ -471,7 +511,7 @@ Runtime dependencies are pinned in `requirements.lock`; development tools are pi
 ├── Dockerfile
 ├── README.md
 ├── beszel_exporter.py
-├── compose.yaml
+├── docker-compose.yaml
 ├── gunicorn.conf.py
 ├── pyproject.toml
 ├── pytest.ini
