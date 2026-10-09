@@ -49,6 +49,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger("beszel_exporter")
 
+# Limit duplicate warnings to one per metric family per process while still
+# counting every discarded sample. The set is deliberately not keyed by labels.
+_LOGGED_DUPLICATE_METRICS: set[str] = set()
+_LOGGED_DUPLICATE_METRICS_LOCK = threading.Lock()
+
+# Explicit allowlist: an outage must not replay any previously observed
+# operational state/health labels, even for families ending in _info.
+INFO_IDENTITY_LABELS: dict[str, frozenset[str]] = {
+    "beszel_system_info": frozenset({"system", "system_id", "hostname"}),
+    "beszel_system_wifi_info": frozenset({"system", "system_id", "interface"}),
+    "beszel_gpu_info": frozenset({"system", "system_id", "gpu"}),
+    "beszel_container_info": frozenset({"system", "system_id", "container", "container_id"}),
+    "beszel_smart_device_info": frozenset({"system", "system_id", "device", "serial"}),
+    "beszel_systemd_service_info": frozenset({"system", "system_id", "service"}),
+    "beszel_storage_pool_info": frozenset(
+        {"system", "system_id", "pool", "display_name", "pool_type"}
+    ),
+    "beszel_storage_pool_vdev_info": frozenset({"system", "system_id", "pool", "vdev"}),
+}
+
 app = Flask(__name__)
 
 
@@ -198,7 +218,6 @@ class PrometheusText:
     def __init__(self, on_duplicate: Callable[[str], None] | None = None) -> None:
         self.families: dict[str, dict[str, Any]] = {}
         self.dropped_samples = 0
-        self._logged_duplicates: set[str] = set()
         self._on_duplicate = on_duplicate
 
     def add(
@@ -227,11 +246,12 @@ class PrometheusText:
         key = tuple(sorted((str(k), str(v)) for k, v in labels.items() if v is not None))
         if key in family["keys"]:
             # A single malformed/repeated source record must not abort all hosts.
-            # Warn once per metric per collection to avoid flooding logs; count every drop.
+            # Warning once per family *per process*, counter for every drop.
             self.dropped_samples += 1
-            if name not in self._logged_duplicates:
-                logger.warning("Dropping duplicate Prometheus sample for metric %s", name)
-                self._logged_duplicates.add(name)
+            with _LOGGED_DUPLICATE_METRICS_LOCK:
+                if name not in _LOGGED_DUPLICATE_METRICS:
+                    logger.warning("Dropping duplicate Prometheus sample for metric %s", name)
+                    _LOGGED_DUPLICATE_METRICS.add(name)
             if self._on_duplicate is not None:
                 self._on_duplicate(name)
             return
@@ -241,15 +261,21 @@ class PrometheusText:
     def info(self, name: str, labels: dict[str, Any], help_text: str | None = None) -> None:
         self.add(name, 1, labels, help_text=help_text)
 
-    def render(self, *, info_only: bool = False) -> str:
-        """Render full exposition, or only the last-known descriptive info families."""
+    def render(self, *, info_only: bool = False, identity_only: bool = False) -> str:
+        """Render all metrics, info metrics, or allowlisted identity-only info."""
         lines: list[str] = []
         for name, family in self.families.items():
-            if info_only and not name.endswith("_info"):
+            if identity_only:
+                allowed_labels = INFO_IDENTITY_LABELS.get(name)
+                if allowed_labels is None:
+                    continue
+            elif info_only and not name.endswith("_info"):
                 continue
             lines.append(f"# HELP {name} {escape_help(family['help'])}")
             lines.append(f"# TYPE {name} {family['type']}")
             for value, labels in family["samples"]:
+                if identity_only:
+                    labels = {k: v for k, v in labels.items() if k in allowed_labels}
                 if labels:
                     encoded = ",".join(
                         f'{key}="{escape_label(label_value)}"'
@@ -415,8 +441,8 @@ class BeszelCollector:
         self.cache = ""
         self.cache_time = 0.0
         self.cache_ttl = 0.0
-        # Keep only informational metadata for Hub outages; dynamic data must go stale.
-        self.last_good_info = ""
+        # Only allowlisted identity labels are replayable after a Hub outage.
+        self.last_good_identity = ""
         self.last_success = 0.0
         self.collection_errors: defaultdict[str, int] = defaultdict(int)
         self.dropped_samples_total = 0
@@ -490,22 +516,22 @@ class BeszelCollector:
             token = _SCRAPE_DEADLINE.set(deadline)
             try:
                 check_scrape_deadline()
-                data, info_data = self._collect_data(now)
+                data, identity_data = self._collect_data(now)
                 check_scrape_deadline()
-                self.last_good_info = info_data
+                self.last_good_identity = identity_data
                 self.last_success = self.clock()
                 body = self._with_self_metrics(data, 1, time.monotonic() - started)
                 ttl = CACHE_TTL
             except ScrapeDeadlineExceeded:
                 logger.warning("Beszel scrape exceeded SCRAPE_BUDGET_SECONDS=%.1f", SCRAPE_BUDGET_SECONDS)
-                body = self._with_self_metrics(self.last_good_info, 0, time.monotonic() - started)
+                body = self._with_self_metrics(self.last_good_identity, 0, time.monotonic() - started)
                 ttl = FAILURE_CACHE_TTL
             except Exception:
                 logger.exception("Beszel scrape failed")
                 # Never replay un-timestamped CPU, temperature, network, disk or host
                 # availability samples on an outage: Prometheus would record them
                 # as fresh at every subsequent scrape.
-                body = self._with_self_metrics(self.last_good_info, 0, time.monotonic() - started)
+                body = self._with_self_metrics(self.last_good_identity, 0, time.monotonic() - started)
                 ttl = FAILURE_CACHE_TTL
             finally:
                 _SCRAPE_DEADLINE.reset(token)
@@ -603,7 +629,6 @@ class BeszelCollector:
                 continue
             labels = {"system": system.get("name", system_id), "system_id": system_id}
             system_up = system.get("status") == "up"
-            self.emit_system_record(metrics, labels, system, details.get(system_id), system_up)
 
             stats_record = system_stats.get(system_id)
             stats_age = record_age_seconds(stats_record, now)
@@ -615,6 +640,10 @@ class BeszelCollector:
                     help_text="Age of the newest Beszel system_stats record.",
                 )
             stats_fresh = system_up and stats_age is not None and stats_age <= MAX_STATS_AGE_SECONDS
+            self.emit_system_record(
+                metrics, labels, system, details.get(system_id), system_up,
+                include_status=stats_fresh or not system_up,
+            )
             if stats_fresh and stats_record:
                 self.emit_system_stats(metrics, labels, decoded(stats_record.get("stats"), {}))
 
@@ -651,9 +680,9 @@ class BeszelCollector:
         check_scrape_deadline()
         full = metrics.render()
         check_scrape_deadline()
-        metadata = metrics.render(info_only=True)
+        identity = metrics.render(identity_only=True)
         check_scrape_deadline()
-        return full, metadata
+        return full, identity
 
     @staticmethod
     def emit_pair(
@@ -697,22 +726,23 @@ class BeszelCollector:
         system: dict[str, Any],
         details: dict[str, Any] | None,
         system_up: bool,
+        *,
+        include_status: bool = True,
     ) -> None:
         info = decoded(system.get("info"), {})
         details = details or {}
-        metrics.info(
-            "beszel_system_info",
-            {
-                **labels,
-                "status": normalized_system_status(system.get("status")),
-                "agent_version": info.get("v", system.get("v", "")),
-                "hostname": details.get("hostname", info.get("h", "")),
-                "kernel": details.get("kernel", info.get("k", "")),
-                "os_name": details.get("os_name", ""),
-                "cpu_model": details.get("cpu", info.get("m", "")),
-                "root_disk_name": info.get("rdn", ""),
-            },
-        )
+        identity = {
+            **labels,
+            "agent_version": info.get("v", system.get("v", "")),
+            "hostname": details.get("hostname", info.get("h", "")),
+            "kernel": details.get("kernel", info.get("k", "")),
+            "os_name": details.get("os_name", ""),
+            "cpu_model": details.get("cpu", info.get("m", "")),
+            "root_disk_name": info.get("rdn", ""),
+        }
+        if include_status:
+            identity["status"] = normalized_system_status(system.get("status"))
+        metrics.info("beszel_system_info", identity)
         metrics.add("beszel_system_up", 1 if system_up else 0, labels)
         if system_up:
             metrics.add("beszel_system_uptime_seconds", info.get("u"), labels)
@@ -990,8 +1020,11 @@ class BeszelCollector:
                     **series_labels,
                     "container_id": container.get("id", ""),
                     "image": container.get("image", ""),
-                    "status": normalized_container_status(container.get("status")),
                     "ports": container.get("ports", ""),
+                    **(
+                        {"status": normalized_container_status(container.get("status"))}
+                        if emit_dynamic else {}
+                    ),
                 },
             )
             if not emit_dynamic:
@@ -1033,7 +1066,7 @@ class BeszelCollector:
                     "model": device.get("model", ""),
                     "firmware": device.get("firmware", ""),
                     "device_type": device.get("type", ""),
-                    "state": device.get("state", ""),
+                    **({"state": device.get("state", "")} if emit_dynamic else {}),
                 },
             )
             if not emit_dynamic:
@@ -1099,7 +1132,8 @@ class BeszelCollector:
             state_known = 0 <= state < len(states)
             state_text = states[state] if state_known else "unknown"
             substate_text = substates[substate] if 0 <= substate < len(substates) else "unknown"
-            metrics.info("beszel_systemd_service_info", {**service_labels, "state": state_text, "substate": substate_text})
+            state_labels = {"state": state_text, "substate": substate_text} if emit_dynamic else {}
+            metrics.info("beszel_systemd_service_info", {**service_labels, **state_labels})
             if not emit_dynamic:
                 continue
             if state_known:
@@ -1127,7 +1161,7 @@ class BeszelCollector:
                     **pool_labels,
                     "display_name": pool.get("display_name", raw_name),
                     "pool_type": "btrfs" if str(raw_name).startswith("b:") else "zfs",
-                    "health": pool.get("health", ""),
+                    **({"health": pool.get("health", "")} if emit_dynamic else {}),
                 },
             )
             if not emit_dynamic:

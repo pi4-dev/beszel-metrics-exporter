@@ -71,7 +71,45 @@ it does **not** execute one historical query per system/monitor. Instead, it sca
 
 With normal rates and active systems this usually means approximately **three API requests** (one per history collection) per refresh. Offline hosts and disabled monitors do not cause historical pages to be scanned indefinitely, and no warning is generated solely because their IDs have no fresh records. A warning is emitted only if the fresh-result scan reaches the configured page limit while IDs remain unaccounted for. When fresh volume alone exceeds `BULK_MAX_PAGES × BULK_PAGE_SIZE`, some sources can still be missing from a scrape.
 
-Records older than the freshness limit are intentionally not fetched, so their historical `*_stats_age_seconds` values may also be absent. The `*_up` and identity metrics continue to represent known host status.
+**Important:** `*_stats_age_seconds` is emitted only when a recent history
+record was found. Once a record exceeds its freshness window (180 seconds for
+system/container, 600 seconds for network monitors, by default), the age
+metric **disappears**, rather than increasing indefinitely. Consequently a
+rule like `beszel_system_stats_age_seconds > 300` **never fires** with the
+default 180-second cutoff. The `*_up` and identity metrics continue to
+represent known host status while the Hub is reachable.
+
+To detect a host that Beszel marks up but whose system-statistics series has
+disappeared, use this PromQL expression:
+
+```promql
+beszel_system_up == 1
+unless on(system_id) beszel_system_stats_age_seconds
+```
+
+Use a rule `for: 5m` (or an interval suitable for the scrape cadence) to
+avoid transient alerts at startup. For gaps in container history, replace
+`beszel_system_stats_age_seconds` with `beszel_container_stats_age_seconds`.
+For enabled monitors, use:
+
+```promql
+(
+  beszel_network_monitor_enabled == 1
+  and on(system_id) (beszel_system_up == 1)
+)
+unless on(system_id, monitor_id) beszel_network_monitor_stats_age_seconds
+```
+
+A healthy `beszel_exporter_up == 1` should also be required in the alert
+rule, or monitored separately. During Hub outages `beszel_system_up` is
+intentionally absent.
+
+The cutoff uses the **exporter's UTC clock** against timestamps written by the
+Hub. Both systems need synchronized time (NTP/chrony). If the exporter clock is
+ahead of the Hub by more than the configured freshness threshold, fresh Hub
+records can be filtered out and dynamic series silently disappear. An exporter
+clock behind the Hub can make future-dated records appear artificially fresh.
+Check clock synchronization before increasing the freshness limits.
 
 `BeszelAPI.latest()` is also implemented as a true one-record query using `perPage=1`, `sort=-created`, and `skipTotal=1`; it does not traverse all pages.
 
@@ -117,9 +155,9 @@ deadline failure. The budget starts **before waiting for the collector lock**,
 so concurrent scrapes cannot each wait for a prior full scan and then run a new
 full scan.
 
-On deadline exhaustion, the scrape returns `beszel_exporter_up=0`, the
-last-known `*_info` metadata (when the collector lock was acquired), and
-exporter diagnostics. It never publishes partial results as successful or
+On deadline exhaustion, the scrape returns `beszel_exporter_up=0`, only
+last-known **identity-only `*_info` samples** (when the collector lock was
+acquired), and exporter diagnostics. It never publishes partial results as successful or
 replays dynamic values. The usual `FAILURE_CACHE_TTL` reduces repeated Hub
 load, and the next attempt retries. If lock acquisition itself times out, only
 minimal exporter diagnostics are returned, without reading concurrent
@@ -139,8 +177,12 @@ If the required `systems` request fails (or another error aborts the
 collection), the exporter:
 
 1. logs the detailed exception server-side;
-2. serves **only `*_info` metric families from the last successful collection**
-   (if any), together with current exporter self-monitoring metrics;
+2. replays **only allowlisted identity labels** from the last successful
+   `*_info` snapshot (if any), together with current exporter metrics;
+   `status`, `state`, `substate`, `health`, ports, SSIDs and other
+   operational details are excluded; state-only families such as
+   `beszel_storage_pool_health_info` and
+   `beszel_storage_pool_scrub_info` are not replayed;
 3. drops historical CPU, memory, temperatures, network counters, disk metrics,
    monitor results, `*_age_seconds`, and even the last-known
    `beszel_system_up` value;
@@ -153,8 +195,18 @@ that detects the outage**, rather than appearing as flat lines for hours.
 A previously successful response may still be served until its normal
 `CACHE_TTL` (default 15 seconds) expires. Prometheus then marks omitted
 series stale using its normal staleness handling; actual visualization depends
-on the query and backend. `*_info` describes **last-known metadata**, not
-necessarily current container or systemd runtime state.
+on the query and backend. The reduced `*_info` series represent **last-known
+identity only**, not current container, service, SMART or pool health.
+
+Even with a reachable Hub, `status`, `state`, `substate` and `health`
+labels from container/SMART/systemd/pool records are omitted when the source
+system's statistics are stale. For hosts still marked `up` but missing
+fresh system statistics, `beszel_system_info` likewise omits `status`;
+`beszel_system_up` separately reflects the Hub's view of system status.
+When writing state/health alerts based on `*_info`, also gate on
+`beszel_exporter_up == 1` and `beszel_system_up == 1` to avoid conflating
+identity metadata with verified live state. The exporter-only alerts should
+still detect Hub outages independently.
 
 Metadata is kept until replaced by the next successful collection or the
 exporter restarts; no raw metric snapshot is replayed in failure mode. If the
@@ -533,7 +585,8 @@ A repeated Prometheus series (the same metric name and label set), such as two
 container records with the same name, a `bats.primary` and `bat` value in one
 system, or duplicate ZFS dataset entries, no longer aborts the entire collection.
 The exporter retains the **first emitted value**, drops subsequent duplicates,
-and logs a warning once per metric family per collection (not once per drop).
+and logs a warning once per metric family per **exporter process lifetime**
+(not once per scrape or per drop).
 It never logs the potentially sensitive label values in these warnings.
 
 `beszel_exporter_dropped_samples_total` is a **cumulative counter** of all
