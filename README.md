@@ -43,7 +43,7 @@ The exporter is read-only. It never refreshes SMART/ZFS/systemd data and never w
 - Prometheus metric families with `# HELP` and `# TYPE`
 - Bounded bulk retrieval for Beszel `1m` history records
 - Stale-data suppression
-- Last-good-data fallback during Beszel Hub outages
+- Metadata-only fallback during Beszel Hub outages (dynamic samples immediately omitted)
 - Read-only, non-root container image
 - Unit tests, Ruff, `promtool check metrics`, Docker smoke tests and multi-arch GHCR publishing
 
@@ -95,19 +95,38 @@ The separate network-monitor history record limit defaults to:
 MAX_MONITOR_STATS_AGE_SECONDS=600
 ```
 
-Static identity metadata and `beszel_system_up` remain available so a failed source is still identifiable.
+With a reachable Hub, identity metadata and `beszel_system_up` remain
+available to identify down hosts. If the Hub itself becomes unavailable,
+`beszel_system_up` is **not** replayed from cache: its last value no longer
+represents a verified host state.
 
 ## Hub failure behavior
 
-If the required `systems` request fails, the exporter:
+If the required `systems` request fails (or another error aborts the
+collection), the exporter:
 
 1. logs the detailed exception server-side;
-2. serves the last successful metric snapshot, if one exists;
-3. changes `beszel_exporter_up` to `0`;
-4. retains `beszel_exporter_last_success_timestamp_seconds`;
-5. caches the failed result briefly (`FAILURE_CACHE_TTL`, default 5 seconds).
+2. serves **only `*_info` metric families from the last successful collection**
+   (if any), together with current exporter self-monitoring metrics;
+3. drops historical CPU, memory, temperatures, network counters, disk metrics,
+   monitor results, `*_age_seconds`, and even the last-known
+   `beszel_system_up` value;
+4. sets `beszel_exporter_up=0`, retaining
+   `beszel_exporter_last_success_timestamp_seconds` for freshness checks;
+5. caches the degraded response briefly (`FAILURE_CACHE_TTL`, default 5 seconds).
 
-This avoids a queue of repeated 10-second Hub timeouts when multiple scrape requests arrive during a Hub outage.
+Dynamic time series therefore disappear at the **first attempted collection
+that detects the outage**, rather than appearing as flat lines for hours.
+A previously successful response may still be served until its normal
+`CACHE_TTL` (default 15 seconds) expires. Prometheus then marks omitted
+series stale using its normal staleness handling; actual visualization depends
+on the query and backend. `*_info` describes **last-known metadata**, not
+necessarily current container or systemd runtime state.
+
+Metadata is kept until replaced by the next successful collection or the
+exporter restarts; no raw metric snapshot is replayed in failure mode. If the
+first collection fails, the response contains only exporter self-monitoring.
+The failure cache avoids a queue of Hub timeouts during an outage.
 
 The HTTP response does **not** expose the internal exception text or Beszel URL.
 
@@ -437,7 +456,7 @@ It never logs the potentially sensitive label values in these warnings.
 dropped duplicates since the exporter process started. It increments only when
 a new collection runs; responses served from `CACHE_TTL` or
 `FAILURE_CACHE_TTL` do not increment it again. Even if a separate later error
-forces last-good-snapshot fallback, the cumulative counter is retained.
+forces metadata-only fallback, the cumulative counter is retained.
 
 This counter has no labels, avoiding a second cardinality problem. The
 following PromQL shows the number of drops over a period:

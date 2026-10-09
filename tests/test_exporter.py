@@ -120,6 +120,19 @@ def test_prometheus_text_still_rejects_metric_type_conflicts():
         metrics.add("my_metric", 2, metric_type="counter")
 
 
+def test_prometheus_text_info_only_keeps_well_formed_info_families():
+    metrics = exporter.PrometheusText()
+    metrics.info("source_info", {"name": "source-a"})
+    metrics.add("source_cpu_percent", 42, {"name": "source-a"})
+    metrics.add("source_up", 1, {"name": "source-a"})
+    rendered = metrics.render(info_only=True)
+    assert "# HELP source_info " in rendered
+    assert "# TYPE source_info gauge" in rendered
+    assert 'source_info{name="source-a"} 1' in rendered
+    assert "source_cpu_percent" not in rendered
+    assert "source_up" not in rendered
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -406,7 +419,7 @@ def test_duplicate_count_survives_unrelated_hub_outage(monkeypatch):
     assert "beszel_exporter_up 0" in failed
     assert f"beszel_exporter_dropped_samples_total {prior}" in failed
 
-def test_failure_uses_negative_cache_and_does_not_leak_error(monkeypatch):
+def test_hub_failure_returns_only_metadata_and_exporter_metrics(monkeypatch):
     now = [datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()]
     monkeypatch.setattr(exporter, "CACHE_TTL", 0)
     monkeypatch.setattr(exporter, "FAILURE_CACHE_TTL", 5)
@@ -414,14 +427,66 @@ def test_failure_uses_negative_cache_and_does_not_leak_error(monkeypatch):
     collector = exporter.BeszelCollector(api=api, clock=lambda: now[0])
     good = collector.collect()
     assert "beszel_exporter_up 1" in good
+    assert "beszel_system_cpu_usage_percent" in good
+    assert "beszel_container_cpu_usage_percent" in good
+    assert "beszel_system_up" in good
+    last_success = collector.last_success
 
     api.fail_systems = True
     now[0] += 1
     failed = collector.collect()
     assert "beszel_exporter_up 0" in failed
     assert "beszel_system_info" in failed
+    assert "beszel_container_info" in failed
+    assert "# TYPE beszel_system_info gauge" in failed
+    assert "beszel_exporter_last_success_timestamp_seconds" in failed
+    assert collector.last_success == last_success
     assert "secret-internal" not in failed
 
+    # Only descriptive metadata may be replayed. Host up=1 is omitted too:
+    # with the Hub unavailable, exporter cannot verify current host availability.
+    for line in failed.splitlines():
+        if line.startswith("#") or not line:
+            continue
+        metric_name = line.split("{", 1)[0].split(" ", 1)[0]
+        assert metric_name.endswith("_info") or metric_name.startswith("beszel_exporter_")
+    assert "beszel_system_cpu_usage_percent" not in failed
+    assert "beszel_system_temperature_celsius" not in failed
+    assert "beszel_system_up" not in failed
+    assert "beszel_system_stats_age_seconds" not in failed
+    assert "beszel_container_cpu_usage_percent" not in failed
+    assert "beszel_network_monitor_response_seconds" not in failed
+
     now[0] += 1
-    cached = collector.collect()
-    assert cached == failed
+    assert collector.collect() == failed  # FAILURE_CACHE_TTL protects Hub from retries
+
+    # Repeated scrapes hours into the outage must not reintroduce CPU, disk,
+    # temperature or availability values with new timestamps.
+    now[0] += 3600
+    still_failed = collector.collect()
+    assert "beszel_exporter_up 0" in still_failed
+    assert "beszel_system_cpu_usage_percent" not in still_failed
+    assert "beszel_system_up" not in still_failed
+    assert "beszel_system_info" in still_failed
+    assert collector.last_success == last_success
+
+    api.fail_systems = False
+    api.now = now[0]  # New upstream records on recovery
+    now[0] += 6
+    recovered = collector.collect()
+    assert "beszel_exporter_up 1" in recovered
+    assert "beszel_system_cpu_usage_percent" in recovered
+    assert "beszel_system_up" in recovered
+    assert collector.last_success > last_success
+
+
+def test_hub_failure_before_initial_success_has_only_self_metrics(monkeypatch):
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    api = FakeAPI(now, fail_systems=True)
+    collector = exporter.BeszelCollector(api=api, clock=lambda: now)
+    failed = collector.collect()
+    assert "beszel_exporter_up 0" in failed
+    assert "beszel_system_info" not in failed
+    assert "beszel_system_up" not in failed
+    assert "beszel_system_cpu_usage_percent" not in failed

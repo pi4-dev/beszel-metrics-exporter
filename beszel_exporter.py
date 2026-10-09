@@ -212,9 +212,12 @@ class PrometheusText:
     def info(self, name: str, labels: dict[str, Any], help_text: str | None = None) -> None:
         self.add(name, 1, labels, help_text=help_text)
 
-    def render(self) -> str:
+    def render(self, *, info_only: bool = False) -> str:
+        """Render full exposition, or only the last-known descriptive info families."""
         lines: list[str] = []
         for name, family in self.families.items():
+            if info_only and not name.endswith("_info"):
+                continue
             lines.append(f"# HELP {name} {escape_help(family['help'])}")
             lines.append(f"# TYPE {name} {family['type']}")
             for value, labels in family["samples"]:
@@ -359,7 +362,8 @@ class BeszelCollector:
         self.cache = ""
         self.cache_time = 0.0
         self.cache_ttl = 0.0
-        self.last_good_data = ""
+        # Keep only informational metadata for Hub outages; dynamic data must go stale.
+        self.last_good_info = ""
         self.last_success = 0.0
         self.collection_errors: defaultdict[str, int] = defaultdict(int)
         self.dropped_samples_total = 0
@@ -404,14 +408,17 @@ class BeszelCollector:
                 return self.cache
             started = self.clock()
             try:
-                data = self._collect_data(now)
-                self.last_good_data = data
+                data, info_data = self._collect_data(now)
+                self.last_good_info = info_data
                 self.last_success = self.clock()
                 body = self._with_self_metrics(data, 1, self.clock() - started)
                 ttl = CACHE_TTL
             except Exception:
                 logger.exception("Beszel scrape failed")
-                body = self._with_self_metrics(self.last_good_data, 0, self.clock() - started)
+                # Never replay un-timestamped CPU, temperature, network, disk or host
+                # availability samples on an outage: Prometheus would record them
+                # as fresh at every subsequent scrape.
+                body = self._with_self_metrics(self.last_good_info, 0, self.clock() - started)
                 ttl = FAILURE_CACHE_TTL
             self.cache = body
             self.cache_time = self.clock()
@@ -448,7 +455,7 @@ class BeszelCollector:
         )
         return data + metrics.render()
 
-    def _collect_data(self, now: float) -> str:
+    def _collect_data(self, now: float) -> tuple[str, str]:
         metrics = PrometheusText(on_duplicate=self._record_dropped_sample)
         systems = self.api.records("systems")
         system_ids = {row.get("id") for row in systems if row.get("id")}
@@ -546,7 +553,7 @@ class BeszelCollector:
                 stats_fresh,
                 now,
             )
-        return metrics.render()
+        return metrics.render(), metrics.render(info_only=True)
 
     @staticmethod
     def emit_pair(
