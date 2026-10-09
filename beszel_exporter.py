@@ -273,9 +273,16 @@ class PrometheusText:
                 continue
             lines.append(f"# HELP {name} {escape_help(family['help'])}")
             lines.append(f"# TYPE {name} {family['type']}")
+            seen_identity_series: set[tuple[tuple[str, str], ...]] = set()
             for value, labels in family["samples"]:
                 if identity_only:
                     labels = {k: v for k, v in labels.items() if k in allowed_labels}
+                    key = tuple(sorted((str(k), str(v)) for k, v in labels.items() if v is not None))
+                    if key in seen_identity_series:
+                        # Full info samples can differ only by a now-removed
+                        # state label. Never emit a duplicate identity series.
+                        continue
+                    seen_identity_series.add(key)
                 if labels:
                     encoded = ",".join(
                         f'{key}="{escape_label(label_value)}"'

@@ -750,6 +750,21 @@ def test_lock_wait_is_bounded_by_total_scrape_budget(monkeypatch):
         collector.lock.release()
 
 
+
+def test_identity_only_render_deduplicates_collapsed_dynamic_states():
+    metrics = exporter.PrometheusText()
+    base = {"system": "alpha", "system_id": "sys1", "service": "sshd"}
+    metrics.info("beszel_systemd_service_info", {**base, "state": "active"})
+    metrics.info("beszel_systemd_service_info", {**base, "state": "failed"})
+    assert len(metrics.families["beszel_systemd_service_info"]["samples"]) == 2
+    filtered = metrics.render(identity_only=True)
+    assert len([
+        line for line in filtered.splitlines()
+        if line.startswith("beszel_systemd_service_info{")
+    ]) == 1
+    assert "state=" not in filtered
+
+
 def test_identity_only_render_strips_operational_labels_and_state_only_families():
     metrics = exporter.PrometheusText()
     sys = {"system": "alpha", "system_id": "sys1"}
