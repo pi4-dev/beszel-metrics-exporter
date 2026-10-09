@@ -320,10 +320,19 @@ class BeszelAPI:
         *,
         fields: str,
         filter_expr: str = 'type="1m"',
+        min_created: float | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """Fetch newest records for many relation IDs in a bounded number of requests."""
+        """Fetch fresh records by relation, without paging through stale history."""
         if not wanted_ids:
             return {}
+        if min_created is not None:
+            # PocketBase stores UTC date fields with millisecond precision. Round
+            # the cutoff down to seconds to keep borderline-fresh records; the
+            # caller's record_age_seconds() performs the exact freshness check.
+            cutoff = datetime.fromtimestamp(min_created, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S.000Z"
+            )
+            filter_expr = f'({filter_expr}) && created >= "{cutoff}"'
         found: dict[str, dict[str, Any]] = {}
         pending = set(wanted_ids)
         page = 1
@@ -344,13 +353,15 @@ class BeszelAPI:
                     found[relation_id] = row
                     pending.remove(relation_id)
             if len(items) < BULK_PAGE_SIZE:
+                # Exhausted all fresh records: missing/down/disabled IDs are normal.
                 break
+            if page == BULK_MAX_PAGES:
+                logger.warning(
+                    "Fresh Beszel history scan reached page limit for %s (%s IDs still missing)",
+                    collection,
+                    len(pending),
+                )
             page += 1
-        if pending:
-            logger.warning(
-                "No recent record located in bounded scan",
-                extra={"collection": collection, "missing_count": len(pending)},
-            )
         return found
 
 
@@ -388,6 +399,7 @@ class BeszelCollector:
         wanted_ids: set[str],
         *,
         fields: str,
+        min_created: float,
     ) -> dict[str, dict[str, Any]]:
         try:
             return self.api.latest_by_relation(
@@ -395,6 +407,7 @@ class BeszelCollector:
                 relation_field,
                 wanted_ids,
                 fields=fields,
+                min_created=min_created,
             )
         except Exception:
             self.collection_errors[collection] += 1
@@ -488,18 +501,21 @@ class BeszelCollector:
             "system",
             system_ids,
             fields="system,stats,created,type",
+            min_created=now - MAX_STATS_AGE_SECONDS,
         )
         container_stats = self.optional_latest_by_relation(
             "container_stats",
             "system",
             system_ids,
             fields="system,stats,created,type",
+            min_created=now - MAX_STATS_AGE_SECONDS,
         )
         monitor_stats = self.optional_latest_by_relation(
             "network_monitor_stats",
             "monitor",
             monitor_ids,
             fields="monitor,res_min,res_max,total_count,success_count,res_sum,created,type",
+            min_created=now - MAX_MONITOR_STATS_AGE_SECONDS,
         )
 
         for system in systems:

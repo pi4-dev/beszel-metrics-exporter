@@ -61,6 +61,66 @@ def test_bulk_latest_groups_by_relation_and_stops_after_one_page(monkeypatch):
     assert len(api.calls) == 1
 
 
+class TimeFilteredAPI(exporter.BeszelAPI):
+    """Mimic PocketBase's timestamp filter with many old records in history."""
+
+    def __init__(self, records):
+        self.rows = records
+        self.calls = []
+
+    def get(self, path, params=None):
+        self.calls.append((path, params))
+        assert params["skipTotal"] == 1
+        assert params["sort"] == "-created"
+        cutoff = params["filter"].split('created >= "', 1)[1].split('"', 1)[0]
+        cutoff_timestamp = exporter.parse_timestamp(cutoff)
+        rows = [
+            row for row in self.rows
+            if exporter.parse_timestamp(row["created"]) >= cutoff_timestamp
+        ]
+        rows.sort(key=lambda row: row["created"], reverse=True)
+        size = params["perPage"]
+        start = (params["page"] - 1) * size
+        return {"items": rows[start : start + size]}
+
+
+def test_fresh_history_filter_skips_large_old_history_and_offline_ids(monkeypatch, caplog):
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "BULK_PAGE_SIZE", 500)
+    monkeypatch.setattr(exporter, "BULK_MAX_PAGES", 5)
+    rows = [
+        {"system": "offline", "created": datetime.fromtimestamp(now - 10_000 - i, tz=timezone.utc).isoformat()}
+        for i in range(3_000)
+    ]
+    rows.extend([
+        {"system": "online", "created": datetime.fromtimestamp(now - 20, tz=timezone.utc).isoformat(), "stats": {"cpu": 12}},
+        {"system": "offline", "created": datetime.fromtimestamp(now - 180.5, tz=timezone.utc).isoformat()},
+    ])
+    api = TimeFilteredAPI(rows)
+    found = api.latest_by_relation(
+        "system_stats", "system", {"online", "offline"},
+        fields="system,stats,created,type", min_created=now - 180,
+    )
+    assert set(found) == {"online"}
+    assert len(api.calls) == 1
+    assert 'type="1m"' in api.calls[0][1]["filter"]
+    assert 'created >= "2026-10-05 11:57:00.000Z"' in api.calls[0][1]["filter"]
+    assert not any(record.levelname == "WARNING" for record in caplog.records)
+
+
+def test_bulk_history_cutoff_includes_boundary_and_excludes_older():
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    api = TimeFilteredAPI([
+        {"system": "fresh", "created": "2026-10-05T11:57:00Z"},
+        {"system": "old", "created": "2026-10-05T11:56:59Z"},
+    ])
+    found = api.latest_by_relation(
+        "system_stats", "system", {"fresh", "old"}, fields="system,created,type",
+        min_created=now - 180,
+    )
+    assert set(found) == {"fresh"}
+
+
 def test_json_decoding_accepts_objects_and_strings():
     value = {"x": [1, 2]}
     assert exporter.decoded(value, {}) == value
@@ -266,6 +326,29 @@ class FakeAPI:
             }
         return {}
 
+
+def test_collector_passes_independent_freshness_cutoffs_to_all_history_queries(monkeypatch):
+    class CutoffAPI(FakeAPI):
+        def __init__(self, now):
+            super().__init__(now)
+            self.cutoffs = {}
+
+        def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
+            self.cutoffs[collection] = kwargs["min_created"]
+            return super().latest_by_relation(collection, relation_field, wanted_ids, **kwargs)
+
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    monkeypatch.setattr(exporter, "MAX_STATS_AGE_SECONDS", 180)
+    monkeypatch.setattr(exporter, "MAX_MONITOR_STATS_AGE_SECONDS", 600)
+    api = CutoffAPI(now)
+    result = exporter.BeszelCollector(api=api, clock=lambda: now).collect()
+    assert "beszel_exporter_up 1" in result
+    assert api.cutoffs == {
+        "system_stats": now - 180,
+        "container_stats": now - 180,
+        "network_monitor_stats": now - 600,
+    }
 
 def test_stale_stats_are_not_exported(monkeypatch):
     now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()

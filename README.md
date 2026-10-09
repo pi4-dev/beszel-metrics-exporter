@@ -65,7 +65,13 @@ For high-frequency history collections:
 - `container_stats`
 - `network_monitor_stats`
 
-it does **not** execute one historical query per system/monitor. Instead, it scans newest `type="1m"` records in bounded pages and keeps the first record for each relation ID. With normal active systems this usually reduces the history lookup to approximately three API requests per exporter refresh instead of multiple requests per system and monitor.
+it does **not** execute one historical query per system/monitor. Instead, it scans newest `type="1m"` records in bounded pages and keeps the first record for each relation ID.
+
+**Only fresh history is requested from PocketBase:** `system_stats` and `container_stats` use `created >= now - MAX_STATS_AGE_SECONDS` (default 180 seconds), while `network_monitor_stats` uses `created >= now - MAX_MONITOR_STATS_AGE_SECONDS` (default 600 seconds). The cutoff is rounded down to a whole second on the server-side query; the exporter still checks exact record age after retrieval.
+
+With normal rates and active systems this usually means approximately **three API requests** (one per history collection) per refresh. Offline hosts and disabled monitors do not cause historical pages to be scanned indefinitely, and no warning is generated solely because their IDs have no fresh records. A warning is emitted only if the fresh-result scan reaches the configured page limit while IDs remain unaccounted for. When fresh volume alone exceeds `BULK_MAX_PAGES × BULK_PAGE_SIZE`, some sources can still be missing from a scrape.
+
+Records older than the freshness limit are intentionally not fetched, so their historical `*_stats_age_seconds` values may also be absent. The `*_up` and identity metrics continue to represent known host status.
 
 `BeszelAPI.latest()` is also implemented as a true one-record query using `perPage=1`, `sort=-created`, and `skipTotal=1`; it does not traverse all pages.
 
