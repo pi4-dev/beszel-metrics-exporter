@@ -372,6 +372,7 @@ def test_network_monitor_probe_buckets_are_disjoint(
             "created": "2026-10-09T11:59:30Z",
             "total_count": total_count,
             "success_count": success_count,
+            "res_sum": 9000,
         }},
         True,
         now,
@@ -384,12 +385,6 @@ def test_network_monitor_probe_buckets_are_disjoint(
                 "beszel_network_monitor_packet_loss_percent", {"samples": []}
             )["samples"]
         )
-        assert not any(
-            labels.get("window") == "1m_avg"
-            for _, labels in metrics.families.get(
-                "beszel_network_monitor_response_seconds", {"samples": []}
-            )["samples"]
-        )
     else:
         got = {
             labels["result"]: value
@@ -398,6 +393,41 @@ def test_network_monitor_probe_buckets_are_disjoint(
         }
         assert got == expected
         assert sum(got.values()) == total_count
+
+    averages = [
+        value for value, labels in metrics.families.get(
+            "beszel_network_monitor_response_seconds", {"samples": []}
+        )["samples"] if labels.get("window") == "1m_avg"
+    ]
+    if success_count > 0:
+        assert averages == [pytest.approx(9000 / success_count / 1_000_000)]
+    else:
+        assert averages == []
+
+
+def test_network_monitor_average_survives_missing_total_count():
+    now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc).timestamp()
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_network_monitors(
+        metrics,
+        SYSTEM,
+        [{"id": "mon1", "interval": 30}],
+        {"mon1": {
+            "created": "2026-10-09T11:59:30Z",
+            "success_count": 3,
+            "res_sum": 12_000,
+        }},
+        True,
+        now,
+    )
+    assert "beszel_network_monitor_probes" not in metrics.families
+    assert "beszel_network_monitor_packet_loss_percent" not in metrics.families
+    avg = [
+        value for value, labels in samples(
+            metrics, "beszel_network_monitor_response_seconds"
+        ) if labels["window"] == "1m_avg"
+    ]
+    assert avg == [pytest.approx(0.004)]
 
 
 def test_legacy_mib_rates_convert_to_bytes_and_new_bytes_take_precedence(monkeypatch):

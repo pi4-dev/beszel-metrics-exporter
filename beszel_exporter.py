@@ -1272,7 +1272,8 @@ class BeszelCollector:
             response_sum = numeric(record.get("res_sum")) or 0
             # Rolling 1m observations can decrease, so this is a gauge.
             # Categories must be disjoint to support sum without(result).
-            # Suppress impossible loss/average as well as impossible probe counts.
+            # Suppress impossible loss and probe buckets. The average uses
+            # only res_sum/success_count and must not depend on total_count.
             consistent = total >= 0 and 0 <= success <= total
             if consistent:
                 for result, count in (("success", success), ("failure", total - success)):
@@ -1292,7 +1293,7 @@ class BeszelCollector:
                 microseconds_to_seconds(record.get("res_max")),
                 {**monitor_labels, "window": "1m_max"},
             )
-            if consistent and success:
+            if success > 0:
                 metrics.add(
                     "beszel_network_monitor_response_seconds",
                     float(response_sum) / float(success) / 1_000_000,
