@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import json
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -938,6 +941,184 @@ class BudgetResponse:
         return self.data
 
 
+def make_jwt(exp):
+    """Test-only unsigned JWT: only the unverified exp claim is consumed."""
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": exp, "sub": "example"}).encode()
+    ).decode().rstrip("=")
+    return f"header.{payload}.signature"
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("invalid", None),
+        ("header.e30.signature", None),
+        ("header.###.signature", None),
+        (make_jwt(None), None),
+        (make_jwt("1780000000"), None),
+        (make_jwt(True), None),
+        (make_jwt(1800000000), 1800000000.0),
+    ],
+)
+def test_jwt_expiration_parsing_is_strict(token, expected):
+    assert exporter.jwt_expires_at(token) == expected
+
+
+def test_password_token_renews_before_expiry(monkeypatch):
+    monkeypatch.setattr(exporter, "BESZEL_TOKEN", "")
+    monkeypatch.setattr(exporter, "BESZEL_USER", "user")
+    monkeypatch.setattr(exporter, "BESZEL_PASSWORD", "secret")
+    session_token = make_jwt(time.time() + 3600)
+    refreshed_token = make_jwt(time.time() + 7200)
+
+    class MockSession:
+        def __init__(self):
+            self.headers = {}
+            self.posts = 0
+            self.gets = 0
+
+        def post(self, url, json, timeout):
+            self.posts += 1
+            return BudgetResponse({"token": refreshed_token})
+
+        def get(self, url, params, timeout):
+            self.gets += 1
+            return BudgetResponse({"items": [{"id": "host"}]})
+
+    api = exporter.BeszelAPI()
+    api.session = MockSession()
+    api.token = session_token
+    api.session.headers["Authorization"] = session_token
+    # A valid token just outside the refresh window is reused.
+    assert api.get("/test")["items"]
+    assert api.session.posts == 0
+    api.token = make_jwt(time.time() + 590)
+    api.session.headers["Authorization"] = api.token
+    assert api.get("/test")["items"]
+    assert api.session.posts == 1
+    assert api.token == refreshed_token
+    assert api.get("/test")["items"]
+    assert api.session.posts == 1
+    assert api.session.gets == 3
+
+
+@pytest.mark.parametrize("static_token", [
+    "not-a-jwt",
+    make_jwt(1000),
+    make_jwt(time.time() + 590),
+])
+def test_invalid_or_near_expiry_static_token_fails_without_http(monkeypatch, static_token):
+    monkeypatch.setattr(exporter, "BESZEL_TOKEN", static_token)
+
+    class NoRequests:
+        headers = {}
+
+        def get(self, *args, **kwargs):
+            raise AssertionError("must reject static token before HTTP")
+
+        def post(self, *args, **kwargs):
+            raise AssertionError("static token must never password-login")
+
+    api = exporter.BeszelAPI()
+    api.session = NoRequests()
+    with pytest.raises(RuntimeError, match="BESZEL_TOKEN"):
+        api.get("/api/collections/systems/records")
+
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    out = exporter.BeszelCollector(api=api).collect()
+    assert "beszel_exporter_up 0" in out
+    assert "beszel_exporter_systems" not in out
+
+
+def test_valid_static_token_does_not_password_login_or_retry_empty_systems(monkeypatch):
+    monkeypatch.setattr(exporter, "BESZEL_TOKEN", make_jwt(time.time() + 3600))
+
+    class EmptySession:
+        def __init__(self):
+            self.headers = {}
+            self.gets = 0
+
+        def post(self, *args, **kwargs):
+            raise AssertionError("static token must not password-login")
+
+        def get(self, url, params, timeout):
+            self.gets += 1
+            return BudgetResponse({"items": [], "totalPages": 1})
+
+    api = exporter.BeszelAPI()
+    api.session = EmptySession()
+    assert api.records("systems") == []
+    assert api.session.gets == 1
+
+
+def test_empty_systems_relogin_retries_once_then_returns_hosts(monkeypatch):
+    monkeypatch.setattr(exporter, "BESZEL_TOKEN", "")
+    monkeypatch.setattr(exporter, "BESZEL_USER", "user")
+    monkeypatch.setattr(exporter, "BESZEL_PASSWORD", "secret")
+
+    class EmptyThenFound:
+        def __init__(self):
+            self.headers = {}
+            self.posts = 0
+            self.gets = 0
+
+        def post(self, url, json, timeout):
+            self.posts += 1
+            return BudgetResponse({"token": make_jwt(time.time() + 3600)})
+
+        def get(self, url, params, timeout):
+            self.gets += 1
+            if self.gets == 1:
+                return BudgetResponse({"items": [], "totalPages": 1})
+            return BudgetResponse({"items": [{"id": "sys1"}], "totalPages": 1})
+
+    api = exporter.BeszelAPI()
+    api.session = EmptyThenFound()
+    rows = api.records("systems")
+    assert [row["id"] for row in rows] == ["sys1"]
+    assert api.session.posts == 2
+    assert api.session.gets == 2
+
+
+def test_empty_systems_after_password_relogin_visible_as_zero(monkeypatch, caplog):
+    monkeypatch.setattr(exporter, "BESZEL_TOKEN", "")
+    monkeypatch.setattr(exporter, "BESZEL_USER", "user")
+    monkeypatch.setattr(exporter, "BESZEL_PASSWORD", "secret")
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+
+    class AlwaysEmpty:
+        def __init__(self):
+            self.headers = {}
+            self.posts = 0
+            self.gets = 0
+
+        def post(self, url, json, timeout):
+            self.posts += 1
+            return BudgetResponse({"token": make_jwt(time.time() + 3600)})
+
+        def get(self, url, params, timeout):
+            self.gets += 1
+            return BudgetResponse({"items": [], "totalPages": 1})
+
+    api = exporter.BeszelAPI()
+    api.session = AlwaysEmpty()
+    out = exporter.BeszelCollector(api=api).collect()
+    assert "beszel_exporter_systems 0" in out
+    assert "beszel_exporter_up 1" in out
+    assert "empty after a fresh password login" in caplog.text
+    assert api.session.gets == 2
+    assert api.session.posts == 2
+
+
+def test_full_collector_exports_visible_systems_count(monkeypatch):
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    out = exporter.BeszelCollector(api=FakeAPI(now), clock=lambda: now).collect()
+    assert "# TYPE beszel_exporter_systems gauge" in out
+    assert "beszel_exporter_systems 1" in out
+
+
 def test_http_requests_share_one_budget_across_auth_and_401_retry(monkeypatch):
     tick = [100.0]
     monkeypatch.setattr(exporter.time, "monotonic", lambda: tick[0])
@@ -955,7 +1136,7 @@ def test_http_requests_share_one_budget_across_auth_and_401_retry(monkeypatch):
         def post(self, url, json, timeout):
             self.calls.append(("post", timeout))
             tick[0] += 1
-            return BudgetResponse({"token": "new-token"})
+            return BudgetResponse({"token": make_jwt(time.time() + 3600)})
 
         def get(self, url, params, timeout):
             self.calls.append(("get", timeout))

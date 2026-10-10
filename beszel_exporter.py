@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import math
@@ -28,6 +29,7 @@ BESZEL_URL = os.getenv("BESZEL_URL", "http://beszel:8090").rstrip("/")
 BESZEL_USER = os.getenv("BESZEL_USER", "")
 BESZEL_PASSWORD = os.getenv("BESZEL_PASSWORD", "")
 BESZEL_TOKEN = os.getenv("BESZEL_TOKEN", "")
+TOKEN_REFRESH_MARGIN_SECONDS = 600
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10"))
 SCRAPE_BUDGET_SECONDS = float(os.getenv("SCRAPE_BUDGET_SECONDS", "15"))
 if not math.isfinite(SCRAPE_BUDGET_SECONDS) or SCRAPE_BUDGET_SECONDS <= 0:
@@ -107,6 +109,27 @@ def numeric(value: Any) -> float | int | None:
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def jwt_expires_at(token: str) -> float | None:
+    """Read the unverified JWT exp claim for scheduling, not authentication."""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3 or not parts[1] or len(parts[1]) > 16384:
+            return None
+        payload_bytes = base64.urlsafe_b64decode(
+            parts[1] + "=" * (-len(parts[1]) % 4)
+        )
+        payload = json.loads(payload_bytes)
+        if not isinstance(payload, dict):
+            return None
+        exp = payload.get("exp")
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+            return None
+        exp = float(exp)
+        return exp if math.isfinite(exp) and exp > 0 else None
+    except (ValueError, UnicodeDecodeError, TypeError, OverflowError):
+        return None
 
 
 def decoded(value: Any, default: Any) -> Any:
@@ -301,13 +324,30 @@ class PrometheusText:
 class BeszelAPI:
     def __init__(self) -> None:
         self.session = requests.Session()
+        self.static_token = bool(BESZEL_TOKEN)
         self.token = BESZEL_TOKEN
         if self.token:
             self.session.headers["Authorization"] = self.token
 
+    def _clear_token(self) -> None:
+        self.token = ""
+        self.session.headers.pop("Authorization", None)
+
     def authenticate(self) -> None:
         if self.token:
-            return
+            expiry = jwt_expires_at(self.token)
+            remaining = None if expiry is None else expiry - time.time()
+            if remaining is not None and remaining > TOKEN_REFRESH_MARGIN_SECONDS:
+                return
+            if self.static_token:
+                logger.error(
+                    "Configured BESZEL_TOKEN has no valid JWT exp or expires "
+                    "within %s seconds; rotate the token",
+                    TOKEN_REFRESH_MARGIN_SECONDS,
+                )
+                raise RuntimeError("Configured BESZEL_TOKEN is invalid or near expiry")
+            logger.info("Beszel auth token missing expiry or near expiry; re-authenticating")
+            self._clear_token()
         if not BESZEL_USER or not BESZEL_PASSWORD:
             raise RuntimeError("Configure BESZEL_TOKEN or BESZEL_USER and BESZEL_PASSWORD")
         response = self.session.post(
@@ -317,8 +357,19 @@ class BeszelAPI:
         )
         check_scrape_deadline()
         response.raise_for_status()
-        self.token = response.json()["token"]
-        self.session.headers["Authorization"] = self.token
+        token = response.json().get("token")
+        expiry = jwt_expires_at(token) if isinstance(token, str) else None
+        if expiry is None or expiry <= time.time():
+            raise RuntimeError("Beszel login returned a token without a valid future JWT exp")
+        self.token = token
+        self.session.headers["Authorization"] = token
+
+    def reauthenticate(self) -> None:
+        """Force a fresh password login after 401 or a suspicious empty systems list."""
+        if self.static_token:
+            raise RuntimeError("Cannot refresh a static BESZEL_TOKEN")
+        self._clear_token()
+        self.authenticate()
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         check_scrape_deadline()
@@ -327,11 +378,12 @@ class BeszelAPI:
             f"{BESZEL_URL}{path}", params=params, timeout=bounded_request_timeout()
         )
         check_scrape_deadline()
-        if response.status_code == 401 and not BESZEL_TOKEN:
+        if response.status_code == 401:
+            if self.static_token:
+                logger.error("Configured BESZEL_TOKEN rejected with HTTP 401")
+                raise RuntimeError("Configured BESZEL_TOKEN rejected by Beszel")
             logger.info("Beszel token rejected; re-authenticating")
-            self.token = ""
-            self.session.headers.pop("Authorization", None)
-            self.authenticate()
+            self.reauthenticate()
             response = self.session.get(
                 f"{BESZEL_URL}{path}", params=params, timeout=bounded_request_timeout()
             )
@@ -350,24 +402,39 @@ class BeszelAPI:
         sort: str | None = None,
         per_page: int = 500,
     ) -> list[dict[str, Any]]:
-        page = 1
-        result: list[dict[str, Any]] = []
+        retried_empty = False
         while True:
-            check_scrape_deadline()
-            params: dict[str, Any] = {"page": page, "perPage": per_page}
-            if fields:
-                params["fields"] = fields
-            if filter_expr:
-                params["filter"] = filter_expr
-            if sort:
-                params["sort"] = sort
-            payload = self.get(f"/api/collections/{collection}/records", params=params)
-            items = payload.get("items", [])
-            result.extend(items)
-            if page >= int(payload.get("totalPages", 1)):
-                break
-            page += 1
-        return result
+            page = 1
+            result: list[dict[str, Any]] = []
+            while True:
+                check_scrape_deadline()
+                params: dict[str, Any] = {"page": page, "perPage": per_page}
+                if fields:
+                    params["fields"] = fields
+                if filter_expr:
+                    params["filter"] = filter_expr
+                if sort:
+                    params["sort"] = sort
+                payload = self.get(f"/api/collections/{collection}/records", params=params)
+                items = payload.get("items", [])
+                result.extend(items)
+                if page >= int(payload.get("totalPages", 1)):
+                    break
+                page += 1
+            if collection != "systems" or result:
+                return result
+            if self.static_token or retried_empty:
+                logger.warning(
+                    "Beszel systems list is empty%s; check token validity and "
+                    "system-sharing permissions",
+                    " after a fresh password login" if retried_empty else "",
+                )
+                return result
+            # PocketBase can return HTTP 200 + [] for an unauthenticated list.
+            # Retry exactly once with a new password-authenticated session.
+            logger.warning("Beszel systems list empty; retrying after re-authentication")
+            self.reauthenticate()
+            retried_empty = True
 
     def latest_by_relation(
         self,
@@ -575,6 +642,11 @@ class BeszelCollector:
         metrics = PrometheusText(on_duplicate=self._record_dropped_sample)
         systems = self.api.records("systems")
         system_ids = {row.get("id") for row in systems if row.get("id")}
+        metrics.add(
+            "beszel_exporter_systems",
+            len(system_ids),
+            help_text="Number of distinct Beszel systems visible to the configured account.",
+        )
         up_ids = {
             row["id"]
             for row in systems

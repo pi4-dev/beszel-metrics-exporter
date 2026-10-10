@@ -277,7 +277,19 @@ BESZEL_USER=monitoring@example.invalid
 BESZEL_PASSWORD=change-me
 ```
 
-The exporter re-authenticates when a password-authenticated request receives HTTP 401.
+The exporter reads the JWT `exp` claim (without verifying the signature) and
+re-authenticates proactively when fewer than **10 minutes** remain, as well
+as when a password-authenticated request receives HTTP 401. A missing or
+malformed expiry also forces a password login. An authentication response
+without a valid future JWT expiry is rejected.
+
+PocketBase may return HTTP 200 with an empty `systems` list when a token
+is rejected as unauthenticated. If password authentication yields an empty
+`systems` result, the exporter forces **one** fresh login and repeats the
+query; a still-empty result is logged as a warning and published explicitly
+as `beszel_exporter_systems 0`. A truly empty account or insufficient
+system-sharing permissions can also yield zero: do not assume every empty
+list is a token failure.
 
 ### Static token
 
@@ -287,7 +299,18 @@ Alternatively:
 BESZEL_TOKEN=your-token
 ```
 
-When `BESZEL_TOKEN` is set, username/password authentication is not used. Static-token expiry behavior depends on the Beszel/PocketBase configuration, so username/password authentication is generally safer for unattended operation.
+When `BESZEL_TOKEN` is set, username/password authentication is not used.
+The token must contain a parseable JWT `exp` claim with **more than 10 minutes
+remaining**; otherwise the exporter logs an error and sets
+`beszel_exporter_up=0`. Static tokens cannot be renewed automatically:
+rotate the configured token and restart the exporter, or use password auth
+for unattended operation. A revoked token with an otherwise valid `exp`
+cannot be detected from an unverified JWT payload alone; an empty systems
+list is explicitly visible via `beszel_exporter_systems=0` and logged.
+
+The JWT payload is decoded **only for expiry scheduling**; it is not a
+signature/authenticity check. Server responses and normal system-sharing
+permissions still determine actual access.
 
 ## Quick start
 
@@ -771,6 +794,7 @@ investigated: conflicting data is *discarded*, not merged or summed.
 
 ```text
 beszel_exporter_up
+beszel_exporter_systems
 beszel_exporter_scrape_duration_seconds
 beszel_exporter_last_success_timestamp_seconds
 beszel_exporter_collection_errors_total{collection="..."}
@@ -808,6 +832,19 @@ alert. A historical query failure also produces `found=0` but increments
 `beszel_exporter_collection_errors_total{collection="..."}`; inspect
 exporter logs. If the entire scrape fails, the history gauges are omitted
 rather than replayed from an earlier successful scrape.
+
+Monitor unexpectedly empty source inventories with:
+
+```promql
+beszel_exporter_systems == 0
+```
+
+Set an alert `for: 5m` (or a suitable multiple of the scrape interval) and
+configure a dedicated account with access to at least one system. A value of
+zero can indicate expired/revoked credentials, missing system-sharing
+permissions, or a legitimately empty account. The gauge is emitted for
+successful systems queries (including empty results), but is **absent** on
+failed scrapes; alert separately on `beszel_exporter_up == 0`.
 
 `beszel_exporter_collection_errors_total` increments when an optional
 Beszel collection cannot be read. Detailed causes are written to exporter logs.
