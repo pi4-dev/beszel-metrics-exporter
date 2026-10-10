@@ -491,6 +491,73 @@ def test_network_monitor_probe_buckets_are_disjoint(
         assert averages == []
 
 
+@pytest.mark.parametrize("missing_sum", ["absent", None, "", "not-a-number"])
+def test_network_monitor_missing_response_sum_does_not_fabricate_zero_avg(missing_sum):
+    now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc).timestamp()
+    record = {
+        "created": "2026-10-09T11:59:30Z",
+        "total_count": 5,
+        "success_count": 3,
+        "res_min": 1200,
+        "res_max": 8000,
+    }
+    if missing_sum != "absent":
+        record["res_sum"] = missing_sum
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_network_monitors(
+        metrics, SYSTEM, [{"id": "mon1"}], {"mon1": record}, True, now
+    )
+    probes = {
+        labels["result"]: value
+        for value, labels in samples(metrics, "beszel_network_monitor_probes")
+    }
+    assert probes == {"success": 3, "failure": 2}
+    latency = {
+        labels["window"]: value
+        for value, labels in samples(metrics, "beszel_network_monitor_response_seconds")
+    }
+    assert latency == {"1m_min": pytest.approx(0.0012), "1m_max": pytest.approx(0.008)}
+    loss = {
+        labels["window"]: value
+        for value, labels in samples(metrics, "beszel_network_monitor_packet_loss_percent")
+    }
+    assert loss == {"1m": 40}
+
+
+@pytest.mark.parametrize("missing_key", ["total_count", "success_count"])
+def test_network_monitor_missing_count_does_not_fabricate_probe_buckets(missing_key):
+    now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc).timestamp()
+    record = {
+        "created": "2026-10-09T11:59:30Z",
+        "total_count": 5,
+        "success_count": 3,
+        "res_sum": 12_000,
+        "res_min": 1000,
+        "res_max": 6000,
+    }
+    record.pop(missing_key)
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_network_monitors(
+        metrics, SYSTEM, [{"id": "mon1"}], {"mon1": record}, True, now
+    )
+    assert "beszel_network_monitor_probes" not in metrics.families
+    assert "beszel_network_monitor_packet_loss_percent" not in metrics.families
+    observed = {
+        labels["window"]: value
+        for value, labels in metrics.families.get(
+            "beszel_network_monitor_response_seconds", {"samples": []}
+        )["samples"]
+    }
+    if missing_key == "total_count":
+        assert observed == {
+            "1m_min": pytest.approx(0.001),
+            "1m_max": pytest.approx(0.006),
+            "1m_avg": pytest.approx(0.004),
+        }
+    else:
+        assert observed == {}
+
+
 def test_network_monitor_average_survives_missing_total_count():
     now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc).timestamp()
     metrics = exporter.PrometheusText()

@@ -1287,14 +1287,22 @@ class BeszelCollector:
             if not source_fresh or not record or age is None or age > MAX_MONITOR_STATS_AGE_SECONDS:
                 continue
 
-            total = numeric(record.get("total_count")) or 0
-            success = numeric(record.get("success_count")) or 0
-            response_sum = numeric(record.get("res_sum")) or 0
+            # A missing count is unknown, not a zero-valued observation.
+            # Keep the three inputs independent: the response average only
+            # requires a positive success_count and a real res_sum.
+            total = numeric(record.get("total_count"))
+            success = numeric(record.get("success_count"))
+            response_sum = numeric(record.get("res_sum"))
             # Rolling 1m observations can decrease, so this is a gauge.
             # Categories must be disjoint to support sum without(result).
-            # Suppress impossible loss and probe buckets. The average uses
-            # only res_sum/success_count and must not depend on total_count.
-            consistent = total >= 0 and 0 <= success <= total
+            # Suppress impossible loss or probe buckets when counts are absent
+            # or inconsistent. Average latency is independent of total_count.
+            consistent = (
+                total is not None
+                and success is not None
+                and total >= 0
+                and 0 <= success <= total
+            )
             if consistent:
                 for result, count in (("success", success), ("failure", total - success)):
                     metrics.add(
@@ -1305,7 +1313,7 @@ class BeszelCollector:
                     )
             # At 100% packet loss the agent stores res_min=res_max=0.
             # All minute response windows require at least one success.
-            if success > 0:
+            if success is not None and success > 0:
                 metrics.add(
                     "beszel_network_monitor_response_seconds",
                     microseconds_to_seconds(record.get("res_min")),
@@ -1316,12 +1324,13 @@ class BeszelCollector:
                     microseconds_to_seconds(record.get("res_max")),
                     {**monitor_labels, "window": "1m_max"},
                 )
-                metrics.add(
-                    "beszel_network_monitor_response_seconds",
-                    float(response_sum) / float(success) / 1_000_000,
-                    {**monitor_labels, "window": "1m_avg"},
-                )
-            if consistent and total:
+                if response_sum is not None:
+                    metrics.add(
+                        "beszel_network_monitor_response_seconds",
+                        float(response_sum) / float(success) / 1_000_000,
+                        {**monitor_labels, "window": "1m_avg"},
+                    )
+            if consistent and total > 0:
                 metrics.add(
                     "beszel_network_monitor_packet_loss_percent",
                     (float(total) - float(success)) * 100 / float(total),
