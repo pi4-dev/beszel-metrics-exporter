@@ -246,14 +246,16 @@ def test_network_monitor_one_minute_aggregates_and_age():
     assert one(metrics, "beszel_network_monitor_enabled")[0] == 1
     assert one(metrics, "beszel_network_monitor_interval_seconds")[0] == 60
     assert one(metrics, "beszel_network_monitor_stats_age_seconds")[0] == 30
-    probes = {labels["result"]: value for value, labels in samples(
-        metrics, "beszel_network_monitor_probes"
-    )}
-    assert probes == {"total": 10, "success": 7}
+    probe_series = samples(metrics, "beszel_network_monitor_probes")
+    assert all(labels["window"] == "1m" for _, labels in probe_series)
+    probes = {labels["result"]: value for value, labels in probe_series}
+    assert probes == {"success": 7, "failure": 3}
+    assert sum(probes.values()) == 10  # No overlapping total/success series.
     assert metrics.families["beszel_network_monitor_probes"]["type"] == "gauge"
     exposition = metrics.render()
     assert "# TYPE beszel_network_monitor_probes gauge" in exposition
-    assert "# HELP beszel_network_monitor_probes Number of probes in the latest 1-minute Beszel monitor history aggregate." in exposition
+    assert "# HELP beszel_network_monitor_probes Number of successful or failed probes in the latest 1-minute Beszel monitor history aggregate." in exposition
+    assert 'result="total"' not in exposition
     assert "beszel_network_monitor_probe_count" not in exposition
     seconds = {labels["window"]: value for value, labels in samples(
         metrics, "beszel_network_monitor_response_seconds"
@@ -288,6 +290,10 @@ def test_network_monitor_aggregates_skip_stale_data_and_zero_denominators():
     )
     assert one(result, "beszel_network_monitor_enabled")[0] == 0
     assert "beszel_network_monitor_probes" in result.families
+    assert {
+        (labels["result"], labels["window"]): value
+        for value, labels in samples(result, "beszel_network_monitor_probes")
+    } == {("success", "1m"): 0, ("failure", "1m"): 0}
     assert not any(
         labels["window"] == "1m_avg"
         for _, labels in result.families["beszel_network_monitor_response_seconds"]["samples"]
@@ -307,6 +313,45 @@ def test_network_monitor_aggregates_skip_stale_data_and_zero_denominators():
     )
     assert "beszel_network_monitor_probes" not in source_down.families
     assert "beszel_network_monitor_response_seconds" not in source_down.families
+
+
+@pytest.mark.parametrize(
+    ("total_count", "success_count", "expected"),
+    [
+        (10, 10, {"success": 10, "failure": 0}),
+        (10, 0, {"success": 0, "failure": 10}),
+        (10, 7, {"success": 7, "failure": 3}),
+        (0, 0, {"success": 0, "failure": 0}),
+        (2, 3, None),  # Upstream consistency violation: do not emit negatives.
+    ],
+)
+def test_network_monitor_probe_buckets_are_disjoint(
+    total_count, success_count, expected
+):
+    now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc).timestamp()
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_network_monitors(
+        metrics,
+        SYSTEM,
+        [{"id": "mon1", "interval": 30}],
+        {"mon1": {
+            "created": "2026-10-09T11:59:30Z",
+            "total_count": total_count,
+            "success_count": success_count,
+        }},
+        True,
+        now,
+    )
+    if expected is None:
+        assert "beszel_network_monitor_probes" not in metrics.families
+    else:
+        got = {
+            labels["result"]: value
+            for value, labels in samples(metrics, "beszel_network_monitor_probes")
+            if labels["window"] == "1m"
+        }
+        assert got == expected
+        assert sum(got.values()) == total_count
 
 
 def test_legacy_mib_rates_convert_to_bytes_and_new_bytes_take_precedence(monkeypatch):

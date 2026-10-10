@@ -231,6 +231,7 @@ class FakeAPI:
                     "status": "up",
                     "info": {
                         "u": 1234,
+                        "sv": [42, 1],
                         "wf": {"wlan0": {"s": "HomeSSID"}},
                     },
                 }
@@ -398,6 +399,17 @@ def test_container_info_status_does_not_change_with_uptime(monkeypatch):
     assert info_line(first) == info_line(second)
     assert 'status="running"' in info_line(second)
     assert "3 hours" not in second
+
+
+def test_mock_systemd_service_count_is_gauge_with_valid_name(monkeypatch):
+    # The same FakeAPI also drives tests/render_mock_metrics.py and promtool CI.
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    text = exporter.BeszelCollector(api=FakeAPI(now), clock=lambda: now).collect()
+    assert "# TYPE beszel_systemd_services gauge" in text
+    assert 'beszel_systemd_services{system="source-a",system_id="sys1"} 42' in text
+    assert 'beszel_systemd_services_failed{system="source-a",system_id="sys1"} 1' in text
+    assert "beszel_systemd_services_total" not in text
 
 
 def test_systemd_info_unknown_numeric_codes_are_bounded():

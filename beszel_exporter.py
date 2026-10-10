@@ -749,7 +749,12 @@ class BeszelCollector:
             services = info.get("sv")
             if isinstance(services, list):
                 if len(services) >= 1:
-                    metrics.add("beszel_systemd_services_total", services[0], labels)
+                    metrics.add(
+                        "beszel_systemd_services",
+                        services[0],
+                        labels,
+                        help_text="Number of systemd services reported for a Beszel system.",
+                    )
                 if len(services) >= 2:
                     metrics.add("beszel_systemd_services_failed", services[1], labels)
 
@@ -1253,15 +1258,17 @@ class BeszelCollector:
             total = numeric(record.get("total_count")) or 0
             success = numeric(record.get("success_count")) or 0
             response_sum = numeric(record.get("res_sum")) or 0
-            # Rolling 1m observations can decrease, so this is a gauge,
-            # not a cumulative counter or a histogram _count series.
-            for result, count in (("total", total), ("success", success)):
-                metrics.add(
-                    "beszel_network_monitor_probes",
-                    count,
-                    {**monitor_labels, "result": result},
-                    help_text="Number of probes in the latest 1-minute Beszel monitor history aggregate.",
-                )
+            # Rolling 1m observations can decrease, so this is a gauge.
+            # Categories must be disjoint to support sum without(result).
+            # Never fabricate negative failed-probe counts from inconsistent data.
+            if total >= 0 and 0 <= success <= total:
+                for result, count in (("success", success), ("failure", total - success)):
+                    metrics.add(
+                        "beszel_network_monitor_probes",
+                        count,
+                        {**monitor_labels, "result": result, "window": "1m"},
+                        help_text="Number of successful or failed probes in the latest 1-minute Beszel monitor history aggregate.",
+                    )
             metrics.add(
                 "beszel_network_monitor_response_seconds",
                 microseconds_to_seconds(record.get("res_min")),
