@@ -130,6 +130,7 @@ def test_network_monitor_numeric_ms_history_filter_and_latency_windows():
         {"old", "edge", "fresh", "wrong-tier"},
         fields="monitor,created,type,total_count,success_count,res_sum,res_min,res_max",
         min_created=now - 600,
+        created_format="unix_ms",
     )
     assert set(records) == {"edge", "fresh"}
     assert f"created >= {cutoff_ms}" in api.calls[0][1]["filter"]
@@ -333,7 +334,11 @@ class FakeAPI:
                 }
             ]
         if collection == "systemd_services":
-            return [{"id": "svc", "system": "sys1", "name": "docker.service", "state": 0, "sub": 1, "cpu": 1}]
+            return [{
+                "id": "svc", "system": "sys1", "name": "docker.service",
+                "state": 0, "sub": 1, "cpu": 1,
+                "updated": int((self.now - 60) * 1000),
+            }]
         if collection == "network_monitors":
             return [
                 {
@@ -745,6 +750,82 @@ def test_package_update_counts_have_distinct_metric_names(monkeypatch):
     assert 'beszel_package_updates_pending{system="source-a",system_id="sys1"} 12' in text
     assert 'beszel_package_security_updates_pending{system="source-a",system_id="sys1"} 3' in text
     assert 'beszel_package_updates_pending{system="source-a",system_id="sys1",type=' not in text
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "should_emit"),
+    [
+        (30, True),
+        (600, True),     # Normal 10-minute snapshot interval.
+        (1199, True),
+        (1200, True),    # Two-cycle boundary is inclusive.
+        (1201, False),
+        (3600, False),
+        (None, False),   # Older agent without a systemd snapshot.
+    ],
+)
+def test_systemd_service_updated_controls_runtime_metrics_on_fresh_host(
+    age_seconds, should_emit
+):
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    service = {
+        "name": "docker.service", "state": 0, "sub": 1,
+        "cpu": 5, "cpuPeak": 10, "memory": 100, "memPeak": 200,
+    }
+    if age_seconds is not None:
+        service["updated"] = int((now - age_seconds) * 1000)
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_systemd(
+        metrics, {"system": "source-a", "system_id": "sys1"}, [service],
+        emit_dynamic=True, now=now,
+    )
+    info = next(
+        line for line in metrics.render().splitlines()
+        if line.startswith("beszel_systemd_service_info{")
+    )
+    assert 'service="docker.service"' in info
+    numeric_families = set(metrics.families) - {"beszel_systemd_service_info"}
+    if should_emit:
+        assert 'state="active"' in info
+        assert 'substate="running"' in info
+        assert numeric_families == {
+            "beszel_systemd_service_active",
+            "beszel_systemd_service_failed",
+            "beszel_systemd_service_cpu_usage_percent",
+            "beszel_systemd_service_cpu_peak_percent",
+            "beszel_systemd_service_memory_bytes",
+            "beszel_systemd_service_memory_peak_bytes",
+        }
+    else:
+        assert "state=" not in info
+        assert "substate=" not in info
+        assert not numeric_families
+
+
+def test_stale_systemd_row_hidden_with_fresh_host_and_fresh_stats(monkeypatch):
+    class StaleSystemdAPI(FakeAPI):
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "systemd_services":
+                rows[0]["updated"] = int((self.now - 3600) * 1000)
+            return rows
+
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    rendered = exporter.BeszelCollector(
+        api=StaleSystemdAPI(now), clock=lambda: now
+    ).collect()
+    assert "beszel_exporter_up 1" in rendered
+    assert "beszel_system_cpu_usage_percent" in rendered
+    info = next(
+        line for line in rendered.splitlines()
+        if line.startswith("beszel_systemd_service_info{")
+    )
+    assert 'service="docker.service"' in info
+    assert 'state="' not in info
+    assert 'substate="' not in info
+    assert 'beszel_systemd_service_active{' not in rendered
+    assert 'beszel_systemd_service_cpu_usage_percent{' not in rendered
 
 
 def test_mock_systemd_service_count_is_gauge_with_valid_name(monkeypatch):
@@ -1174,6 +1255,76 @@ def test_http_requests_share_one_budget_across_auth_and_401_retry(monkeypatch):
         exporter._SCRAPE_DEADLINE.reset(token)
 
 
+@pytest.mark.parametrize("num_rows,expected_pages", [(5, 3), (4, 3), (1, 1)])
+def test_records_pagination_uses_skip_total_and_short_page(num_rows, expected_pages):
+    class Pages(exporter.BeszelAPI):
+        def __init__(self):
+            self.calls = []
+
+        def get(self, path, params=None):
+            self.calls.append((path, params))
+            assert params["skipTotal"] == 1
+            assert params["perPage"] == 2
+            start = (params["page"] - 1) * 2
+            return {
+                "items": [{"id": str(n)} for n in range(start, min(start + 2, num_rows))],
+                "totalPages": 9999,  # Must be ignored in skipTotal mode.
+            }
+
+    api = Pages()
+    rows = api.records(
+        "containers", per_page=2, fields="id", filter_expr='status="up"',
+        sort="-created",
+    )
+    assert [r["id"] for r in rows] == [str(i) for i in range(num_rows)]
+    assert len(api.calls) == expected_pages
+    assert all(path == "/api/collections/containers/records" for path, _ in api.calls)
+    assert all(p["fields"] == "id" for _, p in api.calls)
+    assert all(p["filter"] == 'status="up"' for _, p in api.calls)
+    assert all(p["sort"] == "-created" for _, p in api.calls)
+
+
+@pytest.mark.parametrize(
+    ("collection", "created_format", "numeric_expected"),
+    [
+        ("system_stats", "pocketbase", False),
+        ("network_monitor_stats", "unix_ms", True),
+        ("other_collection", "unix_ms", True),
+        ("network_monitor_stats", "pocketbase", False),
+    ],
+)
+def test_history_created_format_is_explicit_not_collection_specific(
+    collection, created_format, numeric_expected
+):
+    class Captured(exporter.BeszelAPI):
+        def __init__(self):
+            self.params = None
+
+        def get(self, path, params=None):
+            self.params = params
+            return {"items": [{"system": "id", "created": "2026-10-05T12:00:00Z"}]}
+
+    api = Captured()
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    assert "id" in api.latest_by_relation(
+        collection, "system", {"id"}, fields="system,created,type",
+        min_created=now - 600, created_format=created_format,
+    )
+    predicate = api.params["filter"]
+    assert ('created >= "' not in predicate) == numeric_expected
+    if numeric_expected:
+        assert f"created >= {int((now - 600) * 1000)}" in predicate
+
+
+def test_history_rejects_unsupported_created_format():
+    api = exporter.BeszelAPI()
+    with pytest.raises(ValueError, match="created_format"):
+        api.latest_by_relation(
+            "system_stats", "system", {"id"}, fields="system,created",
+            created_format="unknown",
+        )
+
+
 def test_records_and_bulk_pagination_stop_on_shared_deadline(monkeypatch):
     tick = [100.0]
     monkeypatch.setattr(exporter.time, "monotonic", lambda: tick[0])
@@ -1389,7 +1540,8 @@ def test_unfresh_system_does_not_expose_saved_runtime_states():
         emit_dynamic=False,
     )
     exporter.BeszelCollector.emit_systemd(
-        m, labels, [{"name": "x.service", "state": 2, "sub": 3}], emit_dynamic=False
+        m, labels, [{"name": "x.service", "state": 2, "sub": 3}],
+        emit_dynamic=False, now=0.0
     )
     exporter.BeszelCollector.emit_storage_pools(
         m, labels, [{"name": "tank", "health": "DEGRADED"}], emit_dynamic=False
