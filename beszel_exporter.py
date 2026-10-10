@@ -12,7 +12,7 @@ from contextvars import ContextVar
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import requests
 from flask import Flask, Response
@@ -37,6 +37,8 @@ if not math.isfinite(SCRAPE_BUDGET_SECONDS) or SCRAPE_BUDGET_SECONDS <= 0:
 CACHE_TTL = float(os.getenv("CACHE_TTL", "15"))
 FAILURE_CACHE_TTL = float(os.getenv("FAILURE_CACHE_TTL", "5"))
 MAX_STATS_AGE_SECONDS = float(os.getenv("MAX_STATS_AGE_SECONDS", "180"))
+# Full systemd snapshots are refreshed every 10m; tolerate two intervals.
+MAX_SYSTEMD_AGE_SECONDS = float(os.getenv("MAX_SYSTEMD_AGE_SECONDS", "1200"))
 MAX_MONITOR_STATS_AGE_SECONDS = float(os.getenv("MAX_MONITOR_STATS_AGE_SECONDS", "600"))
 BULK_PAGE_SIZE = int(os.getenv("BULK_PAGE_SIZE", "500"))
 BULK_MAX_PAGES = int(os.getenv("BULK_MAX_PAGES", "5"))
@@ -408,7 +410,9 @@ class BeszelAPI:
             result: list[dict[str, Any]] = []
             while True:
                 check_scrape_deadline()
-                params: dict[str, Any] = {"page": page, "perPage": per_page}
+                params: dict[str, Any] = {
+                    "page": page, "perPage": per_page, "skipTotal": 1,
+                }
                 if fields:
                     params["fields"] = fields
                 if filter_expr:
@@ -418,7 +422,7 @@ class BeszelAPI:
                 payload = self.get(f"/api/collections/{collection}/records", params=params)
                 items = payload.get("items", [])
                 result.extend(items)
-                if page >= int(payload.get("totalPages", 1)):
+                if len(items) < per_page:
                     break
                 page += 1
             if collection != "systems" or result:
@@ -445,16 +449,15 @@ class BeszelAPI:
         fields: str,
         filter_expr: str = 'type="1m"',
         min_created: float | None = None,
+        created_format: Literal["pocketbase", "unix_ms"] = "pocketbase",
     ) -> dict[str, dict[str, Any]]:
         """Fetch fresh records by relation, without paging through stale history."""
+        if created_format not in ("pocketbase", "unix_ms"):
+            raise ValueError(f"Unsupported created_format: {created_format}")
         if not wanted_ids:
             return {}
         if min_created is not None:
-            if collection == "network_monitor_stats":
-                # Beszel stores network_monitor_stats.created as an INTEGER
-                # Unix timestamp in milliseconds, unlike PocketBase date
-                # fields in system_stats and container_stats. A date-string
-                # comparison suppresses all of the 1m monitor history.
+            if created_format == "unix_ms":
                 cutoff_ms = math.floor(min_created * 1000)
                 filter_expr = f"({filter_expr}) && created >= {cutoff_ms}"
             else:
@@ -542,6 +545,7 @@ class BeszelCollector:
         *,
         fields: str,
         min_created: float,
+        created_format: Literal["pocketbase", "unix_ms"] = "pocketbase",
     ) -> dict[str, dict[str, Any]]:
         try:
             check_scrape_deadline()
@@ -551,6 +555,7 @@ class BeszelCollector:
                 wanted_ids,
                 fields=fields,
                 min_created=min_created,
+                created_format=created_format,
             )
             check_scrape_deadline()
             return records
@@ -701,6 +706,7 @@ class BeszelCollector:
             monitor_ids,
             fields="monitor,res_min,res_max,total_count,success_count,res_sum,created,type",
             min_created=now - MAX_MONITOR_STATS_AGE_SECONDS,
+            created_format="unix_ms",
         )
 
         # Coverage reports active sources only, but bulk history queries above
@@ -773,7 +779,10 @@ class BeszelCollector:
                 now=now,
             )
             self.emit_smart(metrics, labels, grouped["smart_devices"][system_id], emit_dynamic=stats_fresh)
-            self.emit_systemd(metrics, labels, grouped["systemd_services"][system_id], emit_dynamic=stats_fresh)
+            self.emit_systemd(
+                metrics, labels, grouped["systemd_services"][system_id],
+                emit_dynamic=stats_fresh, now=now,
+            )
             self.emit_storage_pools(metrics, labels, grouped["zfs_pools"][system_id], emit_dynamic=stats_fresh)
             self.emit_network_monitors(
                 metrics,
@@ -1249,11 +1258,18 @@ class BeszelCollector:
         services: list[dict[str, Any]],
         *,
         emit_dynamic: bool,
+        now: float,
     ) -> None:
         states = ("active", "inactive", "failed", "activating", "deactivating", "reloading")
         substates = ("dead", "running", "exited", "failed", "unknown")
         for service in services:
             service_labels = {**labels, "service": service.get("name", "")}
+            row_age = record_age_seconds({"created": service.get("updated")}, now)
+            row_fresh = (
+                emit_dynamic
+                and row_age is not None
+                and row_age <= MAX_SYSTEMD_AGE_SECONDS
+            )
             state_value = numeric(service.get("state"))
             substate_value = numeric(service.get("sub"))
             state = (
@@ -1269,9 +1285,9 @@ class BeszelCollector:
             state_known = 0 <= state < len(states)
             state_text = states[state] if state_known else "unknown"
             substate_text = substates[substate] if 0 <= substate < len(substates) else "unknown"
-            state_labels = {"state": state_text, "substate": substate_text} if emit_dynamic else {}
+            state_labels = {"state": state_text, "substate": substate_text} if row_fresh else {}
             metrics.info("beszel_systemd_service_info", {**service_labels, **state_labels})
-            if not emit_dynamic:
+            if not row_fresh:
                 continue
             if state_known:
                 metrics.add("beszel_systemd_service_active", 1 if state == 0 else 0, service_labels)
