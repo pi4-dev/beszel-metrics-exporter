@@ -819,15 +819,27 @@ docker build -t beszel-metrics-exporter .
 CI runs on pull requests and pushes to `main` (avoiding duplicate push+PR runs for feature branches) and performs:
 
 1. Ruff linting
-2. pytest unit tests (including `test_metric_mappings.py`)
-3. mocked metric generation
+2. pytest unit tests (including `test_metric_mappings.py` and
+   `test_metric_coverage.py`)
+3. mocked metric generation using a **full mapping fixture**
 4. Docker Compose configuration validation (including `env_file` precedence,
    local override merging and published loopback port checks)
-5. Docker image build
+5. Docker image build and check of the effective Gunicorn configuration
+   (`control_socket_disable = True`)
 6. container startup smoke test, `/healthz` check and degraded `/metrics`
    check (`beszel_exporter_up 0`)
 7. Docker HEALTHCHECK status verification (must reach `healthy`)
-8. `promtool check metrics` for the mocked exposition
+8. `promtool check metrics` for the full mocked exposition
+
+The coverage contract discovers every statically named `beszel_*` family
+in `beszel_exporter.py`, expands the four dynamic disk-I/O prefixes into
+their metric names, and checks that the full mock scrape actually emits
+them all. Only explicitly enumerated `LEGACY_UNITS` metric names are
+excluded from default-mode coverage. The fixture performs a successful
+scrape after a synthetic optional collection failure, so exporter error
+counters and `beszel_exporter_last_success_timestamp_seconds` are also
+covered. Adding a new metric without extending the fixture fails pytest;
+`promtool` then checks the generated exposition for naming/type errors.
 
 GitHub Actions are pinned to commit SHAs.
 
@@ -875,8 +887,10 @@ Runtime dependencies are pinned in `requirements.lock`; development tools are pi
 ├── requirements-dev.txt
 ├── tests/
 │   ├── conftest.py
+│   ├── metric_coverage_fixture.py
 │   ├── render_mock_metrics.py
 │   ├── test_exporter.py
+│   ├── test_metric_coverage.py
 │   └── test_metric_mappings.py
 └── vmagent-scrape.yaml
 ```
