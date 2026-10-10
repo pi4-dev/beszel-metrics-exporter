@@ -1279,7 +1279,19 @@ class BeszelCollector:
                 if cert.get("issuer"):
                     metrics.info("beszel_network_monitor_tls_cert_info", {**monitor_labels, "issuer": cert.get("issuer", "")})
 
-            if source_fresh:
+            # Beszel updates this row only after the agent returns a result
+            # for this monitor. Fresh host stats alone must never validate
+            # cached per-monitor current/1h values.
+            monitor_updated_age = record_age_seconds(
+                {"created": monitor.get("updated")}, now
+            )
+            current_fresh = (
+                source_fresh
+                and bool(monitor.get("enabled"))
+                and monitor_updated_age is not None
+                and monitor_updated_age <= max(2 * interval, MAX_STATS_AGE_SECONDS)
+            )
+            if current_fresh:
                 # The agent reports zero response time when no probe succeeded.
                 # Suppress missing latency rather than plotting false 0s.
                 current_response = numeric(monitor.get("res"))

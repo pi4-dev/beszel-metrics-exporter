@@ -656,8 +656,17 @@ Missing `total_count` or `success_count` suppresses probe counts and
 1m packet loss instead of fabricating zero-valued observations.
 `current` requires `res > 0`.
 The `1h_*` windows require `loss1h < 100` and a positive response-time
-value. Probe counts and packet-loss percentages remain available even when
-latency series are suppressed.
+value. Additionally, **current and 1h values (both latency and packet loss)**
+are emitted only if the source host has fresh `system_stats`, the monitor is
+`enabled`, and `network_monitors.updated` is present and no older than
+`max(2 * effective_interval_seconds, MAX_STATS_AGE_SECONDS)` (default
+host-statistics threshold: 180 seconds). The `updated` field reflects the
+last actual result written by the Beszel Hub for this specific monitor; a
+working host does not refresh that field for a stopped monitor. Missing or
+stale `updated` suppresses cached current/1h series. Separate 1m series
+come from `network_monitor_stats` and retain their existing timestamp and
+host-freshness checks. Probe counts and packet-loss percentages from valid
+1m history remain available even when cached current/1h series are suppressed.
 
 Packet-loss windows include:
 

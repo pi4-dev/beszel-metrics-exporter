@@ -258,6 +258,7 @@ def test_network_monitor_one_minute_aggregates_and_age():
         "port": 0,
         "enabled": True,
         "interval": 60,
+        "updated": "2026-10-09T11:59:30Z",
         "res": 8000,
         "resAvg1h": 6000,
         "resMin1h": 3000,
@@ -314,6 +315,7 @@ def test_network_monitor_total_packet_loss_omits_all_response_windows():
     monitor = {
         "id": "mon1",
         "enabled": True,
+        "updated": "2026-10-09T11:59:30Z",
         "res": 0,
         "loss": 100,
         "loss1h": 100,
@@ -362,6 +364,8 @@ def test_monitor_hourly_latency_requires_successful_positive_response(
 ):
     monitor = {
         "id": "mon1",
+        "enabled": True,
+        "updated": "2026-10-09T12:00:00Z",
         "res": 0,
         "loss1h": loss1h,
         "resAvg1h": values[0],
@@ -370,7 +374,8 @@ def test_monitor_hourly_latency_requires_successful_positive_response(
     }
     metrics = exporter.PrometheusText()
     exporter.BeszelCollector.emit_network_monitors(
-        metrics, SYSTEM, [monitor], {}, True, 0.0
+        metrics, SYSTEM, [monitor], {}, True,
+        datetime(2026, 10, 9, 12, tzinfo=timezone.utc).timestamp()
     )
     observed = {
         labels["window"]: value
@@ -386,13 +391,101 @@ def test_network_monitor_current_latency_requires_positive_response():
     metrics = exporter.PrometheusText()
     exporter.BeszelCollector.emit_network_monitors(
         metrics, SYSTEM,
-        [{"id": "mon1", "res": 1200, "loss1h": 100, "resAvg1h": 0}],
-        {}, True, 0.0,
+        [{
+            "id": "mon1", "enabled": True,
+            "updated": "2026-10-09T12:00:00Z",
+            "res": 1200, "loss1h": 100, "resAvg1h": 0,
+        }],
+        {}, True, datetime(2026, 10, 9, 12, tzinfo=timezone.utc).timestamp(),
     )
     response = samples(metrics, "beszel_network_monitor_response_seconds")
     assert len(response) == 1
     assert response[0][1]["window"] == "current"
     assert response[0][0] == pytest.approx(0.0012)
+
+
+@pytest.mark.parametrize(
+    ("enabled", "updated_age", "interval", "expected_current"),
+    [
+        (False, 30, 30, False),
+        (True, 3600, 30, False),
+        (True, None, 30, False),
+        (True, 180, 30, True),  # Default threshold, inclusive boundary.
+        (True, 181, 30, False),
+        (True, 599, 300, True),  # Slow probes: 2 * interval exceeds 180s.
+        (True, 600, 300, True),
+        (True, 601, 300, False),
+    ],
+)
+def test_network_monitor_current_and_hourly_require_own_fresh_update(
+    enabled, updated_age, interval, expected_current
+):
+    now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc).timestamp()
+    monitor = {
+        "id": "mon1",
+        "enabled": enabled,
+        "interval": interval,
+        "res": 9000,
+        "resAvg1h": 7000,
+        "resMin1h": 2000,
+        "resMax1h": 15000,
+        "loss": 10,
+        "loss1h": 20,
+    }
+    if updated_age is not None:
+        monitor["updated"] = datetime.fromtimestamp(
+            now - updated_age, tz=timezone.utc
+        ).isoformat()
+    record = {
+        "created": datetime.fromtimestamp(now - 20, tz=timezone.utc).isoformat(),
+        "total_count": 5,
+        "success_count": 4,
+        "res_sum": 16_000,
+        "res_min": 1000,
+        "res_max": 8000,
+    }
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_network_monitors(
+        metrics, SYSTEM, [monitor], {"mon1": record}, True, now
+    )
+    response = {
+        labels["window"]: value
+        for value, labels in samples(metrics, "beszel_network_monitor_response_seconds")
+    }
+    loss = {
+        labels["window"]: value
+        for value, labels in samples(metrics, "beszel_network_monitor_packet_loss_percent")
+    }
+    # Freshly timestamped history is independent of the cached monitor row.
+    assert response["1m_min"] == pytest.approx(0.001)
+    assert response["1m_avg"] == pytest.approx(0.004)
+    assert response["1m_max"] == pytest.approx(0.008)
+    assert loss["1m"] == pytest.approx(20)
+    assert "beszel_network_monitor_interval_seconds" in metrics.families
+    assert one(metrics, "beszel_network_monitor_enabled")[0] == int(enabled)
+    current_keys = {"current", "1h_avg", "1h_min", "1h_max"}
+    if expected_current:
+        assert current_keys <= response.keys()
+        assert {"current", "1h"} <= loss.keys()
+    else:
+        assert not (current_keys & response.keys())
+        assert not ({"current", "1h"} & loss.keys())
+
+
+def test_network_monitor_host_freshness_still_required_for_current_and_hourly():
+    now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc).timestamp()
+    monitor = {
+        "id": "mon1", "enabled": True, "interval": 30,
+        "updated": "2026-10-09T11:59:50Z",
+        "res": 9000, "resMin1h": 2000, "loss1h": 50, "loss": 0,
+    }
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_network_monitors(
+        metrics, SYSTEM, [monitor], {}, False, now
+    )
+    assert "beszel_network_monitor_response_seconds" not in metrics.families
+    assert "beszel_network_monitor_packet_loss_percent" not in metrics.families
+    assert one(metrics, "beszel_network_monitor_enabled")[0] == 1
 
 
 def test_network_monitor_aggregates_skip_stale_data_and_zero_denominators():

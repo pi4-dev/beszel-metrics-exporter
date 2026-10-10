@@ -337,6 +337,9 @@ class FakeAPI:
                     "port": 0,
                     "enabled": True,
                     "interval": 60,
+                    "updated": datetime.fromtimestamp(
+                        self.now - 30, tz=timezone.utc
+                    ).isoformat(),
                     "res": 10_000,
                     "loss": 0,
                     "certInfo": {},
