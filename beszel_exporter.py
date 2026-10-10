@@ -217,7 +217,6 @@ class PrometheusText:
 
     def __init__(self, on_duplicate: Callable[[str], None] | None = None) -> None:
         self.families: dict[str, dict[str, Any]] = {}
-        self.dropped_samples = 0
         self._on_duplicate = on_duplicate
 
     def add(
@@ -248,7 +247,6 @@ class PrometheusText:
             # A single malformed/repeated source record must not abort all hosts.
             # Warning once per family *per process*, counter for every drop.
             # Only the opaque system_id is logged, never other label values.
-            self.dropped_samples += 1
             system_id = labels.get("system_id")
             system_id = str(system_id) if system_id is not None else "unknown"
             with _LOGGED_DUPLICATE_METRICS_LOCK:
@@ -268,16 +266,14 @@ class PrometheusText:
     def info(self, name: str, labels: dict[str, Any], help_text: str | None = None) -> None:
         self.add(name, 1, labels, help_text=help_text)
 
-    def render(self, *, info_only: bool = False, identity_only: bool = False) -> str:
-        """Render all metrics, info metrics, or allowlisted identity-only info."""
+    def render(self, *, identity_only: bool = False) -> str:
+        """Render all metrics or allowlisted identity-only info."""
         lines: list[str] = []
         for name, family in self.families.items():
             if identity_only:
                 allowed_labels = INFO_IDENTITY_LABELS.get(name)
                 if allowed_labels is None:
                     continue
-            elif info_only and not name.endswith("_info"):
-                continue
             lines.append(f"# HELP {name} {escape_help(family['help'])}")
             lines.append(f"# TYPE {name} {family['type']}")
             seen_identity_series: set[tuple[tuple[str, str], ...]] = set()
@@ -372,25 +368,6 @@ class BeszelAPI:
                 break
             page += 1
         return result
-
-    def latest(
-        self,
-        collection: str,
-        filter_expr: str,
-        fields: str | None = None,
-    ) -> dict[str, Any] | None:
-        """Fetch exactly one newest record with exactly one HTTP request."""
-        params: dict[str, Any] = {
-            "page": 1,
-            "perPage": 1,
-            "sort": "-created",
-            "skipTotal": 1,
-            "filter": filter_expr,
-        }
-        if fields:
-            params["fields"] = fields
-        items = self.get(f"/api/collections/{collection}/records", params=params).get("items", [])
-        return items[0] if items else None
 
     def latest_by_relation(
         self,
@@ -1226,6 +1203,8 @@ class BeszelCollector:
                 "server": monitor.get("server", ""),
             }
             metrics.add("beszel_network_monitor_enabled", monitor.get("enabled"), monitor_labels)
+            # PocketBase stores the interval in seconds: the Beszel agent
+            # multiplies the value received from the Hub by time.Second.
             metrics.add("beszel_network_monitor_interval_seconds", monitor.get("interval"), monitor_labels)
 
             cert = decoded(monitor.get("certInfo"), {})
