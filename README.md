@@ -399,9 +399,13 @@ This prevents dashboard variables from mixing label values from unrelated jobs.
 
 A transition from `beszel_systemd_service_info{...,state="active"}` to
 `beszel_systemd_service_info{...}` (no `state` label) creates two distinct
-Prometheus series. Prometheus/vmagent scraping can send the old series'
-**staleness marker** downstream via `remote_write`. The remote-write
-protocol defines a special StaleNaN value (`0x7ff0000000000002`), but
+Prometheus series. Prometheus/vmagent scraping sends the old series'
+**staleness marker** downstream via `remote_write` when staleness tracking is
+enabled. For vmagent, verify that neither `-promscrape.noStaleMarkers`
+nor `no_stale_markers: true` is set. See the
+[vmagent staleness documentation](https://docs.victoriametrics.com/victoriametrics/vmagent/#prometheus-staleness-markers).
+The remote-write protocol defines a special StaleNaN value
+(`0x7ff0000000000002`), but
 support for ingesting remote-write samples is **not itself proof** that a
 particular OpenObserve version uses stale markers correctly during PromQL
 evaluation. That behavior has **not been verified against a running
