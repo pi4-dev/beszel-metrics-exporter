@@ -99,7 +99,7 @@ For enabled monitors, use:
     and on(system_id) (beszel_system_up == 1)
   )
   and on(system_id, monitor_id)
-    (beszel_network_monitor_interval_seconds < 600)
+    (beszel_network_monitor_interval_seconds < 540)
 )
 unless on(system_id, monitor_id) beszel_network_monitor_stats_age_seconds
 ```
@@ -108,11 +108,13 @@ The monitor query deliberately excludes long-interval monitors to avoid false
 positives. Upstream Beszel runs monitor probes on the configured interval and
 persists `network_monitor_stats` history for new probe results; an interval
 greater than the freshness window can legitimately leave no `1m` record
-inside the window. The example uses the default
-`MAX_MONITOR_STATS_AGE_SECONDS=600`; **change the literal `600` if you
-change that environment variable**. Leave a margin below the threshold
-to account for scheduling jitter, collection delay and startup stagger.
-A missing series by itself does not prove a monitor failure.
+inside the window. The example uses `interval_seconds < 540` with the
+default `MAX_MONITOR_STATS_AGE_SECONDS=600` (90% of the freshness window).
+This leaves a 60-second margin for scheduling jitter, collection delays and
+startup stagger. **If you change the freshness limit, adjust `540` to 90%
+of the configured value.** Even a 10% margin cannot guarantee that missed or
+unusually delayed probes will never cause a false alarm. A missing series by
+itself does not prove a monitor failure.
 See [Beszel agent scheduling](https://github.com/henrygd/beszel/blob/main/agent/network_monitor_schedule.go)
 and [Hub stats persistence](https://github.com/henrygd/beszel/blob/main/internal/hub/systems/system.go).
 
@@ -126,8 +128,6 @@ ahead of the Hub by more than the configured freshness threshold, fresh Hub
 records can be filtered out and dynamic series silently disappear. An exporter
 clock behind the Hub can make future-dated records appear artificially fresh.
 Check clock synchronization before increasing the freshness limits.
-
-`BeszelAPI.latest()` is also implemented as a true one-record query using `perPage=1`, `sort=-created`, and `skipTotal=1`; it does not traverse all pages.
 
 ## Stale data handling
 
@@ -487,15 +487,30 @@ the new name or opt in to `LEGACY_UNITS=true` temporarily.
 
 Fast-changing metadata is intentionally isolated in `*_info` metrics.
 
-For example, SMART metadata:
+For example, with **fresh host statistics**, SMART metadata can include
+a last-known operational state:
 
 ```text
-beszel_smart_device_info{device=...,serial=...,model=...,firmware=...,state=...} 1
+beszel_smart_device_info{system_id="sys1",device="/dev/sda",serial="abc",model="Disk",firmware="1.0",state="PASSED"} 1
 ```
 
-while numeric SMART metrics carry only stable device identity labels such as `device` and `serial`.
+When the host's statistics are **stale**, the same `*_info` family omits the
+unverified `state` label:
 
-Container image, container ID, status and port strings are similarly restricted to `beszel_container_info`.
+```text
+beszel_smart_device_info{system_id="sys1",device="/dev/sda",serial="abc",model="Disk",firmware="1.0"} 1
+```
+
+During **Hub outage fallback**, only allowlisted identity labels survive
+(`system`, `system_id`, `device`, `serial` for SMART), and `model` and
+`firmware` are not replayed. Numeric SMART series use stable device/serial
+identity labels, never model or firmware.
+
+Container image, container ID, status and port strings are similarly restricted
+to `beszel_container_info`. `status` and `ports` are included only when
+the host has fresh system statistics, and the Hub outage fallback retains only
+identity labels. Such changes in the label set create distinct Prometheus
+series; see the OpenObserve stale-marker verification instructions above.
 
 ### Lifecycle metadata label cardinality
 
@@ -563,6 +578,13 @@ protocol
 port
 server
 ```
+
+`beszel_network_monitor_interval_seconds` uses the raw
+`network_monitors.interval` value **without conversion**, because Beszel
+stores it in **seconds**. Upstream, the
+[Hub maps the integer interval into the agent configuration](https://github.com/henrygd/beszel/blob/main/internal/hub/network_monitors.go)
+and [the agent multiplies it by `time.Second`](https://github.com/henrygd/beszel/blob/main/agent/network_monitor_schedule.go).
+Thus the alert filter `< 540` above also uses seconds.
 
 Latency windows include, where available:
 
