@@ -1,9 +1,5 @@
-from datetime import datetime, timezone
+"""Render all standard metric families for the CI promtool validator."""
 
-import beszel_exporter as exporter
-from test_exporter import FakeAPI
+from metric_coverage_fixture import render_full_mock
 
-now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
-exporter.CACHE_TTL = 0
-collector = exporter.BeszelCollector(api=FakeAPI(now), clock=lambda: now)
-print(collector.collect(), end="")
+print(render_full_mock(), end="")
