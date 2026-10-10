@@ -572,11 +572,18 @@ beszel_network_monitor_enabled
 beszel_network_monitor_interval_seconds
 beszel_network_monitor_response_seconds
 beszel_network_monitor_packet_loss_percent
-beszel_network_monitor_probe_count
+beszel_network_monitor_probes
 beszel_network_monitor_stats_age_seconds
 beszel_network_monitor_tls_cert_expiry_timestamp_seconds
 beszel_network_monitor_tls_cert_info
 ```
+
+`beszel_network_monitor_probes` is a **gauge** for counts in the latest 1-minute
+history aggregate, not a cumulative counter. It uses `result="total"` and
+`result="success"`. Do not apply `rate()`/`increase()` to these values.
+The former `beszel_network_monitor_probe_count` name was invalid for a non-histogram/
+non-summary metric in `promtool check metrics`; update PromQL queries, Grafana
+dashboards and alert rules to the new name. The old series is no longer emitted.
 
 Common labels:
 
@@ -720,6 +727,7 @@ beszel_exporter_dropped_samples_total
 | `beszel_smart_power_on_hours_total` | `beszel_smart_power_on_seconds_total` by default; hours series requires `LEGACY_UNITS=true` |
 | GPU `name` model label on numeric metrics | model moved to `beszel_gpu_info`; numeric series keyed by stable GPU identifier |
 | Missing / invalid systemd `state` treated as inactive | `state="unknown"`; omit active/failed gauges until state is known |
+| `beszel_network_monitor_probe_count` | renamed to `beszel_network_monitor_probes` (`gauge` with `result="total"/"success"` labels) to comply with Prometheus naming conventions; update existing queries |
 | `beszel_network_monitor_tls_cert_days_remaining` | calculate from expiry timestamp in PromQL |
 | Persistent last host values exported indefinitely | stale dynamic metrics are suppressed |
 | Raw container status like `Up 2 hours` on `beszel_container_info` | normalized to bounded lifecycle states such as `running` or `exited` |

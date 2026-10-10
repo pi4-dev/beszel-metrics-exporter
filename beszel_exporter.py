@@ -1253,8 +1253,15 @@ class BeszelCollector:
             total = numeric(record.get("total_count")) or 0
             success = numeric(record.get("success_count")) or 0
             response_sum = numeric(record.get("res_sum")) or 0
-            metrics.add("beszel_network_monitor_probe_count", total, {**monitor_labels, "result": "total"})
-            metrics.add("beszel_network_monitor_probe_count", success, {**monitor_labels, "result": "success"})
+            # Rolling 1m observations can decrease, so this is a gauge,
+            # not a cumulative counter or a histogram _count series.
+            for result, count in (("total", total), ("success", success)):
+                metrics.add(
+                    "beszel_network_monitor_probes",
+                    count,
+                    {**monitor_labels, "result": result},
+                    help_text="Number of probes in the latest 1-minute Beszel monitor history aggregate.",
+                )
             metrics.add(
                 "beszel_network_monitor_response_seconds",
                 microseconds_to_seconds(record.get("res_min")),

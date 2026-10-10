@@ -247,9 +247,14 @@ def test_network_monitor_one_minute_aggregates_and_age():
     assert one(metrics, "beszel_network_monitor_interval_seconds")[0] == 60
     assert one(metrics, "beszel_network_monitor_stats_age_seconds")[0] == 30
     probes = {labels["result"]: value for value, labels in samples(
-        metrics, "beszel_network_monitor_probe_count"
+        metrics, "beszel_network_monitor_probes"
     )}
     assert probes == {"total": 10, "success": 7}
+    assert metrics.families["beszel_network_monitor_probes"]["type"] == "gauge"
+    exposition = metrics.render()
+    assert "# TYPE beszel_network_monitor_probes gauge" in exposition
+    assert "# HELP beszel_network_monitor_probes Number of probes in the latest 1-minute Beszel monitor history aggregate." in exposition
+    assert "beszel_network_monitor_probe_count" not in exposition
     seconds = {labels["window"]: value for value, labels in samples(
         metrics, "beszel_network_monitor_response_seconds"
     )}
@@ -282,7 +287,7 @@ def test_network_monitor_aggregates_skip_stale_data_and_zero_denominators():
         result, SYSTEM, [monitor], {"mon1": zero_record}, True, now
     )
     assert one(result, "beszel_network_monitor_enabled")[0] == 0
-    assert "beszel_network_monitor_probe_count" in result.families
+    assert "beszel_network_monitor_probes" in result.families
     assert not any(
         labels["window"] == "1m_avg"
         for _, labels in result.families["beszel_network_monitor_response_seconds"]["samples"]
@@ -293,14 +298,14 @@ def test_network_monitor_aggregates_skip_stale_data_and_zero_denominators():
     exporter.BeszelCollector.emit_network_monitors(
         stale, SYSTEM, [monitor], {"mon1": zero_record}, True, now + 601
     )
-    assert "beszel_network_monitor_probe_count" not in stale.families
+    assert "beszel_network_monitor_probes" not in stale.families
     assert one(stale, "beszel_network_monitor_stats_age_seconds")[0] == 631
 
     source_down = exporter.PrometheusText()
     exporter.BeszelCollector.emit_network_monitors(
         source_down, SYSTEM, [monitor], {"mon1": zero_record}, False, now
     )
-    assert "beszel_network_monitor_probe_count" not in source_down.families
+    assert "beszel_network_monitor_probes" not in source_down.families
     assert "beszel_network_monitor_response_seconds" not in source_down.families
 
 
