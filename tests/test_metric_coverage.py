@@ -54,7 +54,7 @@ DISK_IO_SUFFIXES = {
 
 def expected_metric_names():
     source = (Path(__file__).resolve().parent.parent / "beszel_exporter.py").read_text()
-    literal_names = set(re.findall(r'["\\'](beszel_[a-z0-9_]+)["\\']', source))
+    literal_names = set(re.findall(r"""["'](beszel_[a-z0-9_]+)["']""", source))
     prefixes = set(re.findall(r'prefix="(beszel_[a-z0-9_]+)"', source))
     assert prefixes == {
         "beszel_system_disk",
