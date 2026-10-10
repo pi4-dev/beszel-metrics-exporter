@@ -58,9 +58,12 @@ jobs:
 
       - name: Verify Gunicorn control socket disabled
         run: |
+          # Check the config against the installed Gunicorn package, then
+          # verify both the registered setting and the configured value.
           docker run --rm --entrypoint gunicorn beszel-metrics-exporter:test \
-            --config gunicorn.conf.py --print-config beszel_exporter:app \
-            | grep -Fx 'control_socket_disable = True'
+            --config gunicorn.conf.py --check-config beszel_exporter:app
+          docker run --rm --entrypoint python beszel-metrics-exporter:test \
+            -c 'import runpy; from gunicorn.config import Config; assert "control_socket_disable" in Config().settings; assert runpy.run_path("gunicorn.conf.py")["control_socket_disable"] is True; print("Gunicorn control socket disabled")'
 
       - name: Smoke-test container startup and failure-mode metrics
         run: |
