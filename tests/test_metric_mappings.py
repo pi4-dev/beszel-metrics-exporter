@@ -36,13 +36,19 @@ def one(metrics, name):
 def test_systemd_state_mapping_never_defaults_missing_to_inactive(
     state, substate, expected_state, expected_substate, expected_active, expected_failed
 ):
-    record = {"name": "sshd.service", "memory": 256, "cpu": 4}
+    now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc).timestamp()
+    record = {
+        "name": "sshd.service", "memory": 256, "cpu": 4,
+        "updated": int((now - 60) * 1000),
+    }
     if state is not None:
         record["state"] = state
     if substate is not None:
         record["sub"] = substate
     metrics = exporter.PrometheusText()
-    exporter.BeszelCollector.emit_systemd(metrics, SYSTEM, [record], emit_dynamic=True)
+    exporter.BeszelCollector.emit_systemd(
+        metrics, SYSTEM, [record], emit_dynamic=True, now=now
+    )
 
     info_value, info_labels = one(metrics, "beszel_systemd_service_info")
     assert info_value == 1

@@ -55,6 +55,7 @@ class FullMetricAPI(FakeAPI):
                 row.update({
                     "cpu": 1.5, "cpuPeak": 2.5,
                     "memory": 5000, "memPeak": 7000,
+                    "updated": int((self.now - 60) * 1000),
                 })
         elif collection == "network_monitors":
             for row in rows:

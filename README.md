@@ -59,6 +59,11 @@ The exporter reads current-state collections such as:
 - `network_monitors`
 - `zfs_pools`
 
+List queries use PocketBase `skipTotal=1` and stop when a page contains
+fewer records than `perPage`, avoiding a `COUNT` for every page.
+Exact multiples of `perPage` need one final empty-page request; queries
+remain bounded by the shared scrape deadline.
+
 For high-frequency history collections:
 
 - `system_stats`
@@ -67,7 +72,7 @@ For high-frequency history collections:
 
 it does **not** execute one historical query per system/monitor. Instead, it scans newest `type="1m"` records in bounded pages and keeps the first record for each relation ID.
 
-**Only fresh history is requested from PocketBase:** `system_stats` and `container_stats` use `created >= now - MAX_STATS_AGE_SECONDS` (default 180 seconds), while `network_monitor_stats` uses `created >= now - MAX_MONITOR_STATS_AGE_SECONDS` (default 600 seconds). The server-side filter uses a PocketBase **date string** for `system_stats` and `container_stats`, but a **numeric Unix millisecond timestamp** for `network_monitor_stats.created` (Beszel's custom number field). The exporter checks exact record age after retrieval. A date-string filter on `network_monitor_stats` returns no valid history, suppressing `window="1m_min"`, `"1m_max"`, `"1m_avg"` and probe counts.
+**Only fresh history is requested from PocketBase:** `system_stats` and `container_stats` use `created >= now - MAX_STATS_AGE_SECONDS` (default 180 seconds), while `network_monitor_stats` uses `created >= now - MAX_MONITOR_STATS_AGE_SECONDS` (default 600 seconds). The server-side filter uses a PocketBase **date string** for `system_stats` and `container_stats`, but a **numeric Unix millisecond timestamp** for `network_monitor_stats.created` (Beszel's custom number field). The exporter checks exact record age after retrieval. A date-string filter on `network_monitor_stats` returns no valid history, suppressing `window="1m_min"`, `"1m_max"`, `"1m_avg"` and probe counts. The internal `created_format` argument selects `pocketbase` or `unix_ms` independent of the collection name.
 
 With normal rates and active systems this usually means approximately **three API requests** (one per history collection) per refresh. Offline hosts and disabled monitors do not cause historical pages to be scanned indefinitely, and no warning is generated solely because their IDs have no fresh records. A warning is emitted only if the fresh-result scan reaches the configured page limit while IDs remain unaccounted for. When fresh volume alone exceeds `BULK_MAX_PAGES × BULK_PAGE_SIZE`, some sources can still be missing from a scrape.
 
@@ -490,6 +495,7 @@ more labels.
 | `CACHE_TTL` | `15` | Successful full-scrape cache TTL |
 | `FAILURE_CACHE_TTL` | `5` | Negative-cache TTL after a required Hub request fails |
 | `MAX_STATS_AGE_SECONDS` | `180` | Maximum age of dynamic host data |
+| `MAX_SYSTEMD_AGE_SECONDS` | `1200` | Maximum age of per-service dynamic data (two 10-minute systemd snapshots) |
 | `MAX_MONITOR_STATS_AGE_SECONDS` | `600` | Maximum age of `network_monitor_stats` used for 1m aggregates |
 | `BULK_PAGE_SIZE` | `500` | Page size for bulk newest-record scans |
 | `BULK_MAX_PAGES` | `5` | Maximum pages scanned per bulk history collection |
@@ -568,6 +574,24 @@ This absence is intentional: a retained database row is not proof that
 the container is still running. Hub outage fallback retains only allowlisted
 identity labels. Such changes in the label set create distinct Prometheus
 series; see the OpenObserve stale-marker verification instructions above.
+
+### Systemd snapshot freshness
+
+The Beszel agent refreshes full systemd snapshots every **10 minutes**; the Hub
+writes `systemd_services.updated` in Unix milliseconds only when it receives
+a fresh snapshot. Unlike CPU statistics, per-service rows may remain unchanged
+while the host continues reporting normally. The exporter therefore requires
+**both fresh host system statistics** and a per-service `updated` age of at
+most `MAX_SYSTEMD_AGE_SECONDS` (**1200 seconds / 20 minutes** by default,
+two refresh cycles). This threshold is independent of
+`MAX_STATS_AGE_SECONDS=180` and can be adjusted in the exporter environment.
+
+A stale or missing `updated` suppresses per-service active/failed gauges,
+CPU, memory and peak metrics, and `state`/`substate` labels.
+`beszel_systemd_service_info` remains with stable service identity labels.
+A missing snapshot is **not** interpreted as an inactive or healthy service;
+its operational status is unknown. Beszel may eventually prune retained
+rows, but that cleanup is not used as a freshness signal.
 
 ### Lifecycle metadata label cardinality
 
