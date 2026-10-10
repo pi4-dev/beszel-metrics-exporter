@@ -647,6 +647,14 @@ current
 1h_max
 ```
 
+**Missing latency at 100% packet loss is intentional:** Beszel reports zero
+response times when no probe succeeds, but the exporter does not interpret
+these zeros as valid 0-second latency. The `1m_min`, `1m_avg` and `1m_max`
+series require `success_count > 0`; `current` requires `res > 0`.
+The `1h_*` windows require `loss1h < 100` and a positive response-time
+value. Probe counts and packet-loss percentages remain available even when
+latency series are suppressed.
+
 Packet-loss windows include:
 
 ```text

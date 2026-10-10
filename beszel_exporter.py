@@ -1246,17 +1246,29 @@ class BeszelCollector:
                     metrics.info("beszel_network_monitor_tls_cert_info", {**monitor_labels, "issuer": cert.get("issuer", "")})
 
             if source_fresh:
-                for window, value in {
-                    "current": monitor.get("res"),
-                    "1h_avg": monitor.get("resAvg1h"),
-                    "1h_min": monitor.get("resMin1h"),
-                    "1h_max": monitor.get("resMax1h"),
-                }.items():
+                # The agent reports zero response time when no probe succeeded.
+                # Suppress missing latency rather than plotting false 0s.
+                current_response = numeric(monitor.get("res"))
+                if current_response is not None and current_response > 0:
                     metrics.add(
                         "beszel_network_monitor_response_seconds",
-                        microseconds_to_seconds(value),
-                        {**monitor_labels, "window": window},
+                        microseconds_to_seconds(current_response),
+                        {**monitor_labels, "window": "current"},
                     )
+                hourly_loss = numeric(monitor.get("loss1h"))
+                if hourly_loss is not None and 0 <= hourly_loss < 100:
+                    for window, value in {
+                        "1h_avg": monitor.get("resAvg1h"),
+                        "1h_min": monitor.get("resMin1h"),
+                        "1h_max": monitor.get("resMax1h"),
+                    }.items():
+                        response = numeric(value)
+                        if response is not None and response > 0:
+                            metrics.add(
+                                "beszel_network_monitor_response_seconds",
+                                microseconds_to_seconds(response),
+                                {**monitor_labels, "window": window},
+                            )
                 metrics.add(
                     "beszel_network_monitor_packet_loss_percent",
                     monitor.get("loss"),
@@ -1291,17 +1303,19 @@ class BeszelCollector:
                         {**monitor_labels, "result": result, "window": "1m"},
                         help_text="Number of successful or failed probes in the latest 1-minute Beszel monitor history aggregate.",
                     )
-            metrics.add(
-                "beszel_network_monitor_response_seconds",
-                microseconds_to_seconds(record.get("res_min")),
-                {**monitor_labels, "window": "1m_min"},
-            )
-            metrics.add(
-                "beszel_network_monitor_response_seconds",
-                microseconds_to_seconds(record.get("res_max")),
-                {**monitor_labels, "window": "1m_max"},
-            )
+            # At 100% packet loss the agent stores res_min=res_max=0.
+            # All minute response windows require at least one success.
             if success > 0:
+                metrics.add(
+                    "beszel_network_monitor_response_seconds",
+                    microseconds_to_seconds(record.get("res_min")),
+                    {**monitor_labels, "window": "1m_min"},
+                )
+                metrics.add(
+                    "beszel_network_monitor_response_seconds",
+                    microseconds_to_seconds(record.get("res_max")),
+                    {**monitor_labels, "window": "1m_max"},
+                )
                 metrics.add(
                     "beszel_network_monitor_response_seconds",
                     float(response_sum) / float(success) / 1_000_000,
