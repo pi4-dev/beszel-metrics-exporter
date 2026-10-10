@@ -215,6 +215,40 @@ def test_btrfs_pool_type_detected_from_prefix_and_static_info_survives():
     assert "beszel_storage_pool_size_bytes" not in metrics.families
 
 
+@pytest.mark.parametrize(
+    ("updates", "total", "security"),
+    [
+        ([12, 3], 12, 3),
+        ([4], 4, None),  # Upstream security omitted when unknown.
+        ([5, 0], 5, 0),
+        ([2, 3], 2, None),  # Cannot be a subset, suppress bad security data.
+        ([], None, None),
+    ],
+)
+def test_package_updates_are_distinct_with_optional_security(updates, total, security):
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_system_record(
+        metrics,
+        SYSTEM,
+        {"status": "up", "info": {"pu": updates}},
+        {},
+        True,
+    )
+    if total is None:
+        assert "beszel_package_updates_pending" not in metrics.families
+    else:
+        assert one(metrics, "beszel_package_updates_pending") == (total, SYSTEM)
+    if security is None:
+        assert "beszel_package_security_updates_pending" not in metrics.families
+    else:
+        assert one(metrics, "beszel_package_security_updates_pending") == (security, SYSTEM)
+    assert all(
+        "type" not in labels
+        for name in ("beszel_package_updates_pending", "beszel_package_security_updates_pending")
+        for _, labels in metrics.families.get(name, {"samples": []})["samples"]
+    )
+
+
 def test_network_monitor_one_minute_aggregates_and_age():
     now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc).timestamp()
     monitor = {
@@ -344,6 +378,18 @@ def test_network_monitor_probe_buckets_are_disjoint(
     )
     if expected is None:
         assert "beszel_network_monitor_probes" not in metrics.families
+        assert not any(
+            labels.get("window") == "1m"
+            for _, labels in metrics.families.get(
+                "beszel_network_monitor_packet_loss_percent", {"samples": []}
+            )["samples"]
+        )
+        assert not any(
+            labels.get("window") == "1m_avg"
+            for _, labels in metrics.families.get(
+                "beszel_network_monitor_response_seconds", {"samples": []}
+            )["samples"]
+        )
     else:
         got = {
             labels["result"]: value

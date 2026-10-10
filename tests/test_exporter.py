@@ -232,6 +232,7 @@ class FakeAPI:
                     "info": {
                         "u": 1234,
                         "sv": [42, 1],
+                        "pu": [12, 3],
                         "wf": {"wlan0": {"s": "HomeSSID"}},
                     },
                 }
@@ -399,6 +400,15 @@ def test_container_info_status_does_not_change_with_uptime(monkeypatch):
     assert info_line(first) == info_line(second)
     assert 'status="running"' in info_line(second)
     assert "3 hours" not in second
+
+
+def test_package_update_counts_have_distinct_metric_names(monkeypatch):
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    text = exporter.BeszelCollector(api=FakeAPI(now), clock=lambda: now).collect()
+    assert 'beszel_package_updates_pending{system="source-a",system_id="sys1"} 12' in text
+    assert 'beszel_package_security_updates_pending{system="source-a",system_id="sys1"} 3' in text
+    assert 'beszel_package_updates_pending{system="source-a",system_id="sys1",type=' not in text
 
 
 def test_mock_systemd_service_count_is_gauge_with_valid_name(monkeypatch):

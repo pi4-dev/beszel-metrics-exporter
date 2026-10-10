@@ -759,11 +759,23 @@ class BeszelCollector:
                     metrics.add("beszel_systemd_services_failed", services[1], labels)
 
             updates = info.get("pu")
-            if isinstance(updates, list):
-                if len(updates) >= 1:
-                    metrics.add("beszel_package_updates_pending", updates[0], {**labels, "type": "all"})
-                if len(updates) >= 2:
-                    metrics.add("beszel_package_updates_pending", updates[1], {**labels, "type": "security"})
+            if isinstance(updates, list) and updates:
+                # Beszel reports [total, security] and omits security when
+                # the package manager cannot determine which updates are security.
+                total_updates = numeric(updates[0])
+                if total_updates is not None and total_updates >= 0:
+                    metrics.add("beszel_package_updates_pending", total_updates, labels)
+                    if len(updates) >= 2:
+                        security_updates = numeric(updates[1])
+                        if (
+                            security_updates is not None
+                            and 0 <= security_updates <= total_updates
+                        ):
+                            metrics.add(
+                                "beszel_package_security_updates_pending",
+                                security_updates,
+                                labels,
+                            )
 
         for interface, station in decoded(info.get("wf"), {}).items():
             if isinstance(station, dict):
@@ -1260,8 +1272,9 @@ class BeszelCollector:
             response_sum = numeric(record.get("res_sum")) or 0
             # Rolling 1m observations can decrease, so this is a gauge.
             # Categories must be disjoint to support sum without(result).
-            # Never fabricate negative failed-probe counts from inconsistent data.
-            if total >= 0 and 0 <= success <= total:
+            # Suppress impossible loss/average as well as impossible probe counts.
+            consistent = total >= 0 and 0 <= success <= total
+            if consistent:
                 for result, count in (("success", success), ("failure", total - success)):
                     metrics.add(
                         "beszel_network_monitor_probes",
@@ -1279,13 +1292,13 @@ class BeszelCollector:
                 microseconds_to_seconds(record.get("res_max")),
                 {**monitor_labels, "window": "1m_max"},
             )
-            if success:
+            if consistent and success:
                 metrics.add(
                     "beszel_network_monitor_response_seconds",
                     float(response_sum) / float(success) / 1_000_000,
                     {**monitor_labels, "window": "1m_avg"},
                 )
-            if total:
+            if consistent and total:
                 metrics.add(
                     "beszel_network_monitor_packet_loss_percent",
                     (float(total) - float(success)) * 100 / float(total),

@@ -563,6 +563,23 @@ beszel_container_network_combined_bytes_per_second
 
 There is intentionally no `direction="total"` sample in the TX/RX family, because summing the old family without filtering `direction` double-counted traffic.
 
+## Package-update metrics
+
+Beszel reports pending updates as `pu=[totalUpdates, securityUpdates]`;
+`securityUpdates` is a subset of `totalUpdates` and may be omitted if its
+classification is unknown. The exporter exposes **two separate gauges**:
+`beszel_package_updates_pending` (all pending updates) and
+`beszel_package_security_updates_pending` (security only, **absent when
+unknown**). Both have only the normal system labels; neither uses a
+`type` label. Do not add these two overlapping counts together. When
+security is greater than total (inconsistent source data), security is
+suppressed. Migrate `beszel_package_updates_pending{type="all"}` to
+`beszel_package_updates_pending` and
+`beszel_package_updates_pending{type="security"}` to
+`beszel_package_security_updates_pending`.
+
+Upstream definition: [Beszel system Info.PackageUpdates](https://github.com/henrygd/beszel/blob/main/internal/entities/system/system.go).
+
 ## Network-monitor metrics
 
 Important series include:
@@ -742,6 +759,7 @@ beszel_exporter_dropped_samples_total
 | `beszel_network_monitor_probe_count` | renamed to `beszel_network_monitor_probes` (`gauge` with disjoint `result="success"/"failure"` and `window="1m"`); replace `result="total"` queries with `sum without(result)` |
 | `beszel_network_monitor_probes{result="total"/"success"}` | replaced overlapping values with mutually exclusive `success`/`failure` buckets; old `result="total"` is removed |
 | `beszel_systemd_services_total` | renamed to `beszel_systemd_services` (gauge counting currently reported services); update PromQL queries, alerts and dashboards |
+| `beszel_package_updates_pending{type="all"/"security"}` | replaced with separate gauges `beszel_package_updates_pending` (without `type`) and `beszel_package_security_updates_pending`; do not sum these overlapping counts |
 | `beszel_network_monitor_tls_cert_days_remaining` | calculate from expiry timestamp in PromQL |
 | Persistent last host values exported indefinitely | stale dynamic metrics are suppressed |
 | Raw container status like `Up 2 hours` on `beszel_container_info` | normalized to bounded lifecycle states such as `running` or `exited` |
@@ -757,6 +775,13 @@ beszel_system_cpu_usage_percent{...} 12.3
 ```
 
 The collector rejects duplicate name+label samples before rendering. CI also validates mocked exporter output with `promtool check metrics`.
+
+## Gunicorn control socket
+
+The production container runs Gunicorn with one worker and a read-only
+filesystem. Its interactive control interface is unnecessary, so
+`gunicorn.conf.py` sets `control_socket_disable = True` (Gunicorn 25.1+).
+Process management and restarts remain the responsibility of Docker.
 
 ## Development
 
