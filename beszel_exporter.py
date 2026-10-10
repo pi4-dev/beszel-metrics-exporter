@@ -383,13 +383,21 @@ class BeszelAPI:
         if not wanted_ids:
             return {}
         if min_created is not None:
-            # PocketBase stores UTC date fields with millisecond precision. Round
-            # the cutoff down to seconds to keep borderline-fresh records; the
-            # caller's record_age_seconds() performs the exact freshness check.
-            cutoff = datetime.fromtimestamp(min_created, tz=timezone.utc).strftime(
-                "%Y-%m-%d %H:%M:%S.000Z"
-            )
-            filter_expr = f'({filter_expr}) && created >= "{cutoff}"'
+            if collection == "network_monitor_stats":
+                # Beszel stores network_monitor_stats.created as an INTEGER
+                # Unix timestamp in milliseconds, unlike PocketBase date
+                # fields in system_stats and container_stats. A date-string
+                # comparison suppresses all of the 1m monitor history.
+                cutoff_ms = math.floor(min_created * 1000)
+                filter_expr = f"({filter_expr}) && created >= {cutoff_ms}"
+            else:
+                # PocketBase date fields use millisecond precision. Round
+                # down to whole seconds for borderline records; the caller
+                # enforces precise freshness with record_age_seconds().
+                cutoff = datetime.fromtimestamp(min_created, tz=timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%S.000Z"
+                )
+                filter_expr = f'({filter_expr}) && created >= "{cutoff}"'
         found: dict[str, dict[str, Any]] = {}
         pending = set(wanted_ids)
         page = 1

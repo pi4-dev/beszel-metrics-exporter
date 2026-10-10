@@ -83,6 +83,75 @@ def test_fresh_history_filter_skips_large_old_history_and_offline_ids(monkeypatc
     assert not any(record.levelname == "WARNING" for record in caplog.records)
 
 
+class NumericMonitorHistoryAPI(exporter.BeszelAPI):
+    """Emulate PocketBase's numeric-ms timestamp field and server-side filter."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+
+    def get(self, path, params=None):
+        self.calls.append((path, params))
+        assert path == "/api/collections/network_monitor_stats/records"
+        assert params["sort"] == "-created"
+        assert params["skipTotal"] == 1
+        assert 'type="1m"' in params["filter"]
+        # Date-string cutoff is incorrect for this Beszel collection.
+        assert 'created >= "' not in params["filter"]
+        cutoff = int(params["filter"].split("created >= ", 1)[1].split()[0].strip(")"))
+        filtered = [
+            row for row in self.rows
+            if row["type"] == "1m" and row["created"] >= cutoff
+        ]
+        filtered.sort(key=lambda row: row["created"], reverse=True)
+        size = params["perPage"]
+        start = (params["page"] - 1) * size
+        return {"items": filtered[start:start + size]}
+
+
+def test_network_monitor_numeric_ms_history_filter_and_latency_windows():
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
+    cutoff_ms = int((now - 600) * 1000)
+    api = NumericMonitorHistoryAPI([
+        {"monitor": "old", "created": cutoff_ms - 1, "type": "1m"},
+        {"monitor": "edge", "created": cutoff_ms, "type": "1m",
+         "success_count": 1, "total_count": 1, "res_sum": 7000,
+         "res_min": 7000, "res_max": 7000},
+        {"monitor": "fresh", "created": int((now - 30) * 1000), "type": "1m",
+         "success_count": 3, "total_count": 4, "res_sum": 15000,
+         "res_min": 2000, "res_max": 9000},
+        {"monitor": "wrong-tier", "created": int((now - 20) * 1000), "type": "10m"},
+    ])
+    records = api.latest_by_relation(
+        "network_monitor_stats", "monitor",
+        {"old", "edge", "fresh", "wrong-tier"},
+        fields="monitor,created,type,total_count,success_count,res_sum,res_min,res_max",
+        min_created=now - 600,
+    )
+    assert set(records) == {"edge", "fresh"}
+    assert f"created >= {cutoff_ms}" in api.calls[0][1]["filter"]
+    assert exporter.record_age_seconds(records["fresh"], now) == pytest.approx(30)
+    assert exporter.record_age_seconds(records["edge"], now) == pytest.approx(600)
+
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_network_monitors(
+        metrics,
+        {"system": "source-a", "system_id": "sys1"},
+        [{"id": "fresh", "interval": 30, "enabled": True}],
+        records,
+        source_fresh=True,
+        now=now,
+    )
+    latency = {
+        labels["window"]: value
+        for value, labels in metrics.families["beszel_network_monitor_response_seconds"]["samples"]
+    }
+    assert latency["1m_min"] == pytest.approx(0.002)
+    assert latency["1m_max"] == pytest.approx(0.009)
+    assert latency["1m_avg"] == pytest.approx(0.005)
+    assert metrics.families["beszel_network_monitor_stats_age_seconds"]["samples"][0][0] == 30
+
+
 def test_bulk_history_cutoff_includes_boundary_and_excludes_older():
     now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
     api = TimeFilteredAPI([
