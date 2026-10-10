@@ -1203,9 +1203,12 @@ class BeszelCollector:
                 "server": monitor.get("server", ""),
             }
             metrics.add("beszel_network_monitor_enabled", monitor.get("enabled"), monitor_labels)
-            # PocketBase stores the interval in seconds: the Beszel agent
-            # multiplies the value received from the Hub by time.Second.
-            metrics.add("beszel_network_monitor_interval_seconds", monitor.get("interval"), monitor_labels)
+            # Beszel stores intervals in seconds and its agent defaults to 30s
+            # when the configured value is missing or below one second.
+            interval = numeric(monitor.get("interval"))
+            if interval is None or interval < 1:
+                interval = 30
+            metrics.add("beszel_network_monitor_interval_seconds", interval, monitor_labels)
 
             cert = decoded(monitor.get("certInfo"), {})
             if cert:
