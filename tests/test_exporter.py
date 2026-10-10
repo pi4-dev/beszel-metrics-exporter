@@ -915,3 +915,78 @@ def test_duplicate_warning_once_per_metric_process_not_per_scrape(monkeypatch, c
     finally:
         with exporter._LOGGED_DUPLICATE_METRICS_LOCK:
             exporter._LOGGED_DUPLICATE_METRICS.discard(metric)
+
+
+def test_stale_container_info_omits_ports_but_preserves_identity():
+    labels = {"system": "host-a", "system_id": "sys1"}
+    container = {
+        "id": "cid",
+        "name": "app",
+        "status": "Up 3 hours",
+        "ports": "8080/tcp",
+        "image": "example/app:v2",
+        "cpu": 20,
+    }
+    fresh = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_containers(
+        fresh, labels, [container], [], emit_dynamic=True
+    )
+    fresh_info = next(
+        line for line in fresh.render().splitlines()
+        if line.startswith("beszel_container_info{")
+    )
+    assert 'ports="8080/tcp"' in fresh_info
+    assert 'status="running"' in fresh_info
+
+    stale = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_containers(
+        stale, labels, [container], [], emit_dynamic=False
+    )
+    stale_info = next(
+        line for line in stale.render().splitlines()
+        if line.startswith("beszel_container_info{")
+    )
+    assert 'container="app"' in stale_info
+    assert 'container_id="cid"' in stale_info
+    assert "ports=" not in stale_info
+    assert "status=" not in stale_info
+    assert "beszel_container_cpu_usage_percent" not in stale.render()
+
+
+def test_duplicate_warning_includes_first_system_id_debug_identifies_other_hosts(caplog):
+    import logging
+
+    name = "test_duplicate_diagnostics_first_system_id"
+    with exporter._LOGGED_DUPLICATE_METRICS_LOCK:
+        exporter._LOGGED_DUPLICATE_METRICS.discard(name)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="beszel_exporter"):
+            for host in ("sys1", "sys2"):
+                metrics = exporter.PrometheusText()
+                labels = {
+                    "system_id": host,
+                    "system": "private-host",
+                    "container": "secret-container",
+                }
+                metrics.add(name, 1, labels)
+                metrics.add(name, 2, labels)
+                assert metrics.dropped_samples == 1
+
+        warnings = [
+            record.message for record in caplog.records
+            if record.levelno == logging.WARNING and name in record.message
+        ]
+        assert len(warnings) == 1
+        assert "system_id=sys1" in warnings[0]
+        debugs = [
+            record.message for record in caplog.records
+            if record.levelno == logging.DEBUG and name in record.message
+        ]
+        assert len(debugs) == 2
+        assert any("system_id=sys1" in message for message in debugs)
+        assert any("system_id=sys2" in message for message in debugs)
+        assert "private-host" not in caplog.text
+        assert "secret-container" not in caplog.text
+    finally:
+        with exporter._LOGGED_DUPLICATE_METRICS_LOCK:
+            exporter._LOGGED_DUPLICATE_METRICS.discard(name)
