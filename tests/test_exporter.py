@@ -840,12 +840,17 @@ def test_mock_systemd_service_count_is_gauge_with_valid_name(monkeypatch):
 
 
 def test_systemd_info_unknown_numeric_codes_are_bounded():
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
     metrics = exporter.PrometheusText()
     exporter.BeszelCollector.emit_systemd(
         metrics,
         {"system": "source-a", "system_id": "sys1"},
-        [{"name": "x.service", "state": 12345, "sub": 98765}],
+        [{
+            "name": "x.service", "state": 12345, "sub": 98765,
+            "updated": int((now - 60) * 1000),
+        }],
         emit_dynamic=True,
+        now=now,
     )
     result = metrics.render()
     assert 'state="unknown"' in result
