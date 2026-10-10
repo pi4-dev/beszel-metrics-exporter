@@ -800,7 +800,11 @@ def test_duplicate_source_samples_are_isolated_and_counted(monkeypatch):
             rows = super().records(collection, **kwargs)
             if collection == "containers":
                 # Different IDs, but the numeric metrics use the same container name.
-                rows.append({"id": "cid-other", "system": "sys1", "name": "app", "cpu": 99, "memory": 20})
+                rows.append({
+                    "id": "cid-other", "system": "sys1", "name": "app",
+                    "cpu": 99, "memory": 20,
+                    "updated": int((self.now - 30) * 1000),
+                })
             if collection == "zfs_pools":
                 return [{"system": "sys1", "name": "pool", "datasets": [
                     {"name": "ds", "mount": "/mnt/ds", "used": 12, "avail": 20},
@@ -843,7 +847,10 @@ def test_duplicate_count_survives_unrelated_hub_outage(monkeypatch):
         def records(self, collection, **kwargs):
             rows = super().records(collection, **kwargs)
             if collection == "containers":
-                rows.append({"id": "other", "system": "sys1", "name": "app", "cpu": 123})
+                rows.append({
+                    "id": "other", "system": "sys1", "name": "app",
+                    "cpu": 123, "updated": int((self.now - 30) * 1000),
+                })
             return rows
 
     now = [datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()]
@@ -1539,7 +1546,11 @@ def test_stale_container_row_on_fresh_host_exposes_only_identity_info(monkeypatc
     assert "status=" not in info
     assert "ports=" not in info
     assert not any(
-        line.startswith("beszel_container_") and not line.startswith("beszel_container_info")
+        line.startswith("beszel_container_")
+        and not line.startswith((
+            "beszel_container_info",
+            "beszel_container_stats_age_seconds",
+        ))
         for line in output.splitlines() if not line.startswith("#")
     )
 
