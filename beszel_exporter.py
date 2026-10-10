@@ -575,6 +575,11 @@ class BeszelCollector:
         metrics = PrometheusText(on_duplicate=self._record_dropped_sample)
         systems = self.api.records("systems")
         system_ids = {row.get("id") for row in systems if row.get("id")}
+        up_ids = {
+            row["id"]
+            for row in systems
+            if row.get("id") and row.get("status") == "up"
+        }
 
         details = {
             row.get("system", row.get("id")): row
@@ -599,6 +604,11 @@ class BeszelCollector:
             for row in related["network_monitors"]
             if row.get("id")
         }
+        enabled_monitor_ids = {
+            row["id"]
+            for row in related["network_monitors"]
+            if row.get("id") and row.get("enabled") and row.get("system") in up_ids
+        }
         system_stats = self.optional_latest_by_relation(
             "system_stats",
             "system",
@@ -621,26 +631,28 @@ class BeszelCollector:
             min_created=now - MAX_MONITOR_STATS_AGE_SECONDS,
         )
 
-        # Aggregate fresh 1m query coverage without host/monitor labels.
-        # Missing history for offline hosts or disabled monitors is normal.
-        # API failures return empty mappings and increment collection_errors_total.
+        # Coverage reports active sources only, but bulk history queries above
+        # intentionally retain all IDs (including offline/disabled sources).
+        # An offline host or disabled monitor must not lower coverage, even if
+        # an older history row for it happens to be returned by the API.
+        # Read failures still increment collection_errors_total separately.
         for collection, wanted_ids, found in (
-            ("system_stats", system_ids, system_stats),
-            ("container_stats", system_ids, container_stats),
-            ("network_monitor_stats", monitor_ids, monitor_stats),
+            ("system_stats", up_ids, system_stats),
+            ("container_stats", up_ids, container_stats),
+            ("network_monitor_stats", enabled_monitor_ids, monitor_stats),
         ):
             history_labels = {"collection": collection}
             metrics.add(
                 "beszel_exporter_history_records_wanted",
                 len(wanted_ids),
                 history_labels,
-                help_text="Number of distinct source IDs queried for fresh 1m history.",
+                help_text="Number of eligible active system or monitor IDs for fresh 1m history.",
             )
             metrics.add(
                 "beszel_exporter_history_records_found",
-                len(found),
+                len(wanted_ids.intersection(found)),
                 history_labels,
-                help_text="Number of distinct source IDs with fresh 1m history records.",
+                help_text="Number of eligible active IDs with fresh 1m history records.",
             )
 
         for system in systems:

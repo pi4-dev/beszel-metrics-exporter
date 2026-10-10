@@ -759,10 +759,15 @@ beszel_exporter_dropped_samples_total
 
 The two `beszel_exporter_history_records_*` metrics are **gauges**, with
 exactly three `collection` label values: `system_stats`, `container_stats`,
-and `network_monitor_stats`. `wanted` counts distinct system IDs (or monitor
-IDs for network-monitor history) and `found` counts distinct IDs with a
-matching recent `type="1m"` record. Both are emitted on every successful
-collection, including `0` when no source IDs exist or no rows were found.
+and `network_monitor_stats`. `wanted` counts **eligible distinct source IDs**:
+only systems with `status="up"` for `system_stats` and `container_stats`,
+and only `enabled` monitors assigned to up systems for `network_monitor_stats`.
+`found` counts the intersection of eligible IDs with IDs whose recent
+`type="1m"` history records were returned. These are source counts, not the
+total number of history rows; the names are preserved for query compatibility.
+The actual bulk API queries still include offline systems and disabled monitors.
+Both gauges are emitted on every successful collection, including `0`
+when no eligible IDs exist or no matching rows were found.
 No host, system, or monitor labels are used.
 
 Compare the two numbers to detect unexpected loss of history, for example:
@@ -774,8 +779,10 @@ beszel_exporter_history_records_found{collection="network_monitor_stats"}
 ```
 
 A gap alone is **not proof of a broken query**: offline systems and disabled
-or infrequently probed monitors may have no fresh history. A historical
-query failure also produces `found=0` but increments
+monitors are excluded from these coverage figures, but active monitors with
+intervals longer than the freshness window can still lack records. If
+`wanted=0`, there are no eligible sources and coverage should not trigger an
+alert. A historical query failure also produces `found=0` but increments
 `beszel_exporter_collection_errors_total{collection="..."}`; inspect
 exporter logs. If the entire scrape fails, the history gauges are omitted
 rather than replayed from an earlier successful scrape.

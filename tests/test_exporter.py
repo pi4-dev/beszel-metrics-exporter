@@ -489,7 +489,7 @@ def test_history_coverage_handles_zero_sources_and_partial_results(monkeypatch):
     assert history_coverage(partial) == {
         (metric, collection): float(value)
         for collection in ("system_stats", "container_stats", "network_monitor_stats")
-        for metric, value in (("wanted", 2), ("found", 1))
+        for metric, value in (("wanted", 1), ("found", 1))
     }
     empty = exporter.BeszelCollector(
         api=PartialAPI(now, empty=True), clock=lambda: now
@@ -499,6 +499,143 @@ def test_history_coverage_handles_zero_sources_and_partial_results(monkeypatch):
         (metric, collection): 0.0
         for collection in ("system_stats", "container_stats", "network_monitor_stats")
         for metric in ("wanted", "found")
+    }
+
+
+def test_history_coverage_ignores_ineligible_found_rows_but_keeps_bulk_queries(monkeypatch):
+    class AllRowsAPI(FakeAPI):
+        def __init__(self, now):
+            super().__init__(now)
+            self.wanted_queries = {}
+
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "systems":
+                rows.extend([
+                    {"id": "offline", "name": "offline", "status": "down"},
+                    {"id": "paused", "name": "paused", "status": "paused"},
+                ])
+            elif collection == "network_monitors":
+                rows.extend([
+                    {"id": "disabled-up", "system": "sys1", "enabled": False},
+                    {"id": "enabled-offline", "system": "offline", "enabled": True},
+                    {"id": "enabled-paused", "system": "paused", "enabled": True},
+                    {"id": "orphan", "system": "missing", "enabled": True},
+                ])
+            return rows
+
+        def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
+            self.wanted_queries[collection] = set(wanted_ids)
+            rows = super().latest_by_relation(
+                collection, relation_field, wanted_ids, **kwargs
+            )
+            if collection in ("system_stats", "container_stats"):
+                # Offline and paused hosts may still have fresh historic rows.
+                rows["offline"] = {"created": "2026-10-05T11:59:40Z"}
+                rows["paused"] = {"created": "2026-10-05T11:59:40Z"}
+            elif collection == "network_monitor_stats":
+                rows.update({
+                    id_: {"created": "2026-10-05T11:59:40Z"}
+                    for id_ in ("disabled-up", "enabled-offline",
+                                "enabled-paused", "orphan")
+                })
+            return rows
+
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    api = AllRowsAPI(now)
+    output = exporter.BeszelCollector(api=api, clock=lambda: now).collect()
+    assert api.wanted_queries == {
+        "system_stats": {"sys1", "offline", "paused"},
+        "container_stats": {"sys1", "offline", "paused"},
+        "network_monitor_stats": {
+            "mon1", "disabled-up", "enabled-offline", "enabled-paused", "orphan"
+        },
+    }
+    assert history_coverage(output) == {
+        (metric, collection): 1.0
+        for metric in ("wanted", "found")
+        for collection in ("system_stats", "container_stats", "network_monitor_stats")
+    }
+
+
+def test_history_coverage_all_offline_or_disabled_sources_are_zero(monkeypatch):
+    class IneligibleAPI(FakeAPI):
+        def __init__(self, now, mode):
+            super().__init__(now)
+            self.mode = mode
+
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "systems" and self.mode == "offline":
+                rows[0]["status"] = "down"
+            elif collection == "network_monitors":
+                if self.mode == "disabled":
+                    rows[0]["enabled"] = False
+                elif self.mode == "offline":
+                    rows[0]["enabled"] = True
+            return rows
+
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+
+    offline = exporter.BeszelCollector(
+        api=IneligibleAPI(now, "offline"), clock=lambda: now
+    ).collect()
+    assert history_coverage(offline) == {
+        (metric, collection): 0.0
+        for metric in ("wanted", "found")
+        for collection in ("system_stats", "container_stats", "network_monitor_stats")
+    }
+
+    disabled = exporter.BeszelCollector(
+        api=IneligibleAPI(now, "disabled"), clock=lambda: now
+    ).collect()
+    coverage = history_coverage(disabled)
+    assert coverage[("wanted", "system_stats")] == 1
+    assert coverage[("found", "system_stats")] == 1
+    assert coverage[("wanted", "container_stats")] == 1
+    assert coverage[("found", "container_stats")] == 1
+    assert coverage[("wanted", "network_monitor_stats")] == 0
+    assert coverage[("found", "network_monitor_stats")] == 0
+
+
+def test_history_coverage_excludes_missing_active_history_not_inactive_sources(monkeypatch):
+    class MissingActiveAPI(FakeAPI):
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "systems":
+                rows.extend([
+                    {"id": "second-up", "name": "second-up", "status": "up"},
+                    {"id": "offline", "name": "offline", "status": "down"},
+                ])
+            elif collection == "network_monitors":
+                rows.extend([
+                    {"id": "second-mon", "system": "second-up", "enabled": True},
+                    {"id": "disabled", "system": "sys1", "enabled": False},
+                ])
+            return rows
+
+        def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
+            # Only the original system/monitor gets a row; other active
+            # sources have none, while an offline/disabled one has history.
+            rows = super().latest_by_relation(
+                collection, relation_field, wanted_ids, **kwargs
+            )
+            rows["offline" if collection != "network_monitor_stats" else "disabled"] = {
+                "created": "2026-10-05T11:59:40Z"
+            }
+            return rows
+
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    output = exporter.BeszelCollector(
+        api=MissingActiveAPI(now), clock=lambda: now
+    ).collect()
+    assert history_coverage(output) == {
+        (metric, collection): float(value)
+        for collection in ("system_stats", "container_stats", "network_monitor_stats")
+        for metric, value in (("wanted", 2), ("found", 1))
     }
 
 
