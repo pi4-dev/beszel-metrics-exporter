@@ -56,6 +56,12 @@ jobs:
       - name: Build container
         run: docker build -t beszel-metrics-exporter:test .
 
+      - name: Verify Gunicorn control socket disabled
+        run: |
+          docker run --rm --entrypoint gunicorn beszel-metrics-exporter:test \
+            --config gunicorn.conf.py --print-config beszel_exporter:app \
+            | grep -Fx 'control_socket_disable = True'
+
       - name: Smoke-test container startup and failure-mode metrics
         run: |
           docker run -d --rm --name beszel-metrics-exporter-test -p 127.0.0.1:9105:9105 beszel-metrics-exporter:test
