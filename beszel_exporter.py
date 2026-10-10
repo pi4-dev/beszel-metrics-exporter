@@ -247,11 +247,18 @@ class PrometheusText:
         if key in family["keys"]:
             # A single malformed/repeated source record must not abort all hosts.
             # Warning once per family *per process*, counter for every drop.
+            # Only the opaque system_id is logged, never other label values.
             self.dropped_samples += 1
+            system_id = labels.get("system_id")
+            system_id = str(system_id) if system_id is not None else "unknown"
             with _LOGGED_DUPLICATE_METRICS_LOCK:
                 if name not in _LOGGED_DUPLICATE_METRICS:
-                    logger.warning("Dropping duplicate Prometheus sample for metric %s", name)
+                    logger.warning(
+                        "Dropping duplicate Prometheus sample for metric %s (first system_id=%s)",
+                        name, system_id,
+                    )
                     _LOGGED_DUPLICATE_METRICS.add(name)
+            logger.debug("Duplicate sample: metric=%s system_id=%s", name, system_id)
             if self._on_duplicate is not None:
                 self._on_duplicate(name)
             return
@@ -1027,9 +1034,11 @@ class BeszelCollector:
                     **series_labels,
                     "container_id": container.get("id", ""),
                     "image": container.get("image", ""),
-                    "ports": container.get("ports", ""),
                     **(
-                        {"status": normalized_container_status(container.get("status"))}
+                        {
+                            "status": normalized_container_status(container.get("status")),
+                            "ports": container.get("ports", ""),
+                        }
                         if emit_dynamic else {}
                     ),
                 },

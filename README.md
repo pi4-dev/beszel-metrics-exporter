@@ -94,11 +94,27 @@ For enabled monitors, use:
 
 ```promql
 (
-  beszel_network_monitor_enabled == 1
-  and on(system_id) (beszel_system_up == 1)
+  (
+    beszel_network_monitor_enabled == 1
+    and on(system_id) (beszel_system_up == 1)
+  )
+  and on(system_id, monitor_id)
+    (beszel_network_monitor_interval_seconds < 600)
 )
 unless on(system_id, monitor_id) beszel_network_monitor_stats_age_seconds
 ```
+
+The monitor query deliberately excludes long-interval monitors to avoid false
+positives. Upstream Beszel runs monitor probes on the configured interval and
+persists `network_monitor_stats` history for new probe results; an interval
+greater than the freshness window can legitimately leave no `1m` record
+inside the window. The example uses the default
+`MAX_MONITOR_STATS_AGE_SECONDS=600`; **change the literal `600` if you
+change that environment variable**. Leave a margin below the threshold
+to account for scheduling jitter, collection delay and startup stagger.
+A missing series by itself does not prove a monitor failure.
+See [Beszel agent scheduling](https://github.com/henrygd/beszel/blob/main/agent/network_monitor_schedule.go)
+and [Hub stats persistence](https://github.com/henrygd/beszel/blob/main/internal/hub/systems/system.go).
 
 A healthy `beszel_exporter_up == 1` should also be required in the alert
 rule, or monitored separately. During Hub outages `beszel_system_up` is
@@ -197,6 +213,9 @@ A previously successful response may still be served until its normal
 series stale using its normal staleness handling; actual visualization depends
 on the query and backend. The reduced `*_info` series represent **last-known
 identity only**, not current container, service, SMART or pool health.
+In addition to operational status, the container `ports` label is omitted
+while host statistics are stale; it can change following redeployment or
+restart.
 
 Even with a reachable Hub, `status`, `state`, `substate` and `health`
 labels from container/SMART/systemd/pool records are omitted when the source
@@ -375,6 +394,37 @@ For Grafana/OpenObserve dashboards it is recommended to include the scrape job i
 ```
 
 This prevents dashboard variables from mixing label values from unrelated jobs.
+
+### Verify stale-series handling in OpenObserve
+
+A transition from `beszel_systemd_service_info{...,state="active"}` to
+`beszel_systemd_service_info{...}` (no `state` label) creates two distinct
+Prometheus series. Prometheus/vmagent scraping can send the old series'
+**staleness marker** downstream via `remote_write`. The remote-write
+protocol defines a special StaleNaN value (`0x7ff0000000000002`), but
+support for ingesting remote-write samples is **not itself proof** that a
+particular OpenObserve version uses stale markers correctly during PromQL
+evaluation. That behavior has **not been verified against a running
+OpenObserve instance**.
+
+To validate your installed version:
+
+1. Query `beszel_systemd_service_info{job="beszel",system_id="<id>",service="<service>"}`
+   in both OpenObserve and a reference Prometheus engine.
+2. Make the source's system statistics stale (or stop the Beszel Hub),
+   then wait at least one successful scrape of the exporter.
+3. Repeat an **instant-vector** query across the transition. The old
+   `state="active"` series must stop appearing after its stale marker;
+   only the reduced-label identity series should remain.
+4. Test your dashboard's real `on(...)`/`group_left(...)` join. If the
+   old and new series coexist, the join can fail with a many-to-many
+   matching error. Compare the query outcome against reference Prometheus.
+
+Until that check passes, avoid matching changing `*_info` labels in
+critical alerts; use stable IDs such as `system_id` and `service`,
+plus explicit exporter/source freshness checks. This is a receiver/query
+compatibility test, not something the exporter can enforce by including
+more labels.
 
 ## Configuration
 
@@ -586,8 +636,12 @@ container records with the same name, a `bats.primary` and `bat` value in one
 system, or duplicate ZFS dataset entries, no longer aborts the entire collection.
 The exporter retains the **first emitted value**, drops subsequent duplicates,
 and logs a warning once per metric family per **exporter process lifetime**
-(not once per scrape or per drop).
-It never logs the potentially sensitive label values in these warnings.
+(not once per scrape or per drop). The warning contains the first affected
+`system_id` when available; every dropped duplicate also writes a DEBUG
+message with its metric family and `system_id`, helping identify additional
+affected hosts when `LOG_LEVEL=DEBUG`. No container names, targets, serial
+numbers, SSIDs or other potentially sensitive label values are logged.
+DEBUG logging is opt-in and can be verbose if duplicates persist.
 
 `beszel_exporter_dropped_samples_total` is a **cumulative counter** of all
 dropped duplicates since the exporter process started. It increments only when
@@ -679,13 +733,15 @@ docker build -t beszel-metrics-exporter .
 CI runs on pull requests and pushes to `main` (avoiding duplicate push+PR runs for feature branches) and performs:
 
 1. Ruff linting
-2. pytest unit tests
+2. pytest unit tests (including `test_metric_mappings.py`)
 3. mocked metric generation
-4. `promtool check metrics`
-5. Docker build
-6. container startup smoke test
-7. `/healthz` check
-8. failure-mode `/metrics` check
+4. Docker Compose configuration validation (including `env_file` precedence,
+   local override merging and published loopback port checks)
+5. Docker image build
+6. container startup smoke test, `/healthz` check and degraded `/metrics`
+   check (`beszel_exporter_up 0`)
+7. Docker HEALTHCHECK status verification (must reach `healthy`)
+8. `promtool check metrics` for the mocked exposition
 
 GitHub Actions are pinned to commit SHAs.
 
@@ -734,7 +790,8 @@ Runtime dependencies are pinned in `requirements.lock`; development tools are pi
 ├── tests/
 │   ├── conftest.py
 │   ├── render_mock_metrics.py
-│   └── test_exporter.py
+│   ├── test_exporter.py
+│   └── test_metric_mappings.py
 └── vmagent-scrape.yaml
 ```
 
