@@ -364,3 +364,21 @@ def test_healthz_is_process_liveness_not_hub_readiness(monkeypatch):
     # Tests use a minimal Flask stub; the HTTP route itself is covered by
     # the Docker CI smoke test. Here verify health_endpoint never polls Hub.
     assert exporter.health_endpoint() == {"status": "ok"}
+
+
+@pytest.mark.parametrize("interval_seconds", [1, 30, 60, 539, 540, 600, 1200])
+def test_monitor_interval_units_are_seconds(interval_seconds):
+    # Upstream: Hub copies network_monitors.interval (integer) unchanged;
+    # agent schedules probes with time.Duration(interval) * time.Second.
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_network_monitors(
+        metrics,
+        SYSTEM,
+        [{"id": "monitor-one", "interval": interval_seconds, "enabled": True}],
+        {},
+        source_fresh=False,
+        now=0.0,
+    )
+    value, labels = one(metrics, "beszel_network_monitor_interval_seconds")
+    assert value == interval_seconds
+    assert labels["monitor_id"] == "monitor-one"
