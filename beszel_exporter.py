@@ -770,6 +770,7 @@ class BeszelCollector:
                 grouped["containers"][system_id],
                 history,
                 emit_dynamic=stats_fresh,
+                now=now,
             )
             self.emit_smart(metrics, labels, grouped["smart_devices"][system_id], emit_dynamic=stats_fresh)
             self.emit_systemd(metrics, labels, grouped["systemd_services"][system_id], emit_dynamic=stats_fresh)
@@ -1127,6 +1128,7 @@ class BeszelCollector:
         historical_stats: list[dict[str, Any]],
         *,
         emit_dynamic: bool,
+        now: float,
     ) -> None:
         history_by_name = {
             row.get("n"): row
@@ -1136,6 +1138,17 @@ class BeszelCollector:
         for container in containers:
             name = container.get("name", "")
             series_labels = {**labels, "container": name}
+            # Beszel upserts container records but may keep removed containers
+            # or cease updating this collection when using older agents.
+            # Fresh host statistics alone cannot validate container state.
+            row_age = record_age_seconds(
+                {"created": container.get("updated")}, now
+            )
+            row_fresh = (
+                emit_dynamic
+                and row_age is not None
+                and row_age <= MAX_STATS_AGE_SECONDS
+            )
             metrics.info(
                 "beszel_container_info",
                 {
@@ -1147,11 +1160,11 @@ class BeszelCollector:
                             "status": normalized_container_status(container.get("status")),
                             "ports": container.get("ports", ""),
                         }
-                        if emit_dynamic else {}
+                        if row_fresh else {}
                     ),
                 },
             )
-            if not emit_dynamic:
+            if not row_fresh:
                 continue
             metrics.add("beszel_container_cpu_usage_percent", container.get("cpu"), series_labels)
             metrics.add("beszel_container_memory_used_bytes", mib_to_bytes(container.get("memory")), series_labels)

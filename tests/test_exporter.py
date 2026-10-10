@@ -312,7 +312,11 @@ class FakeAPI:
         if collection == "system_details":
             return [{"id": "sys1", "system": "sys1", "hostname": "source-a", "cores": 4, "threads": 4}]
         if collection == "containers":
-            return [{"id": "cid", "system": "sys1", "name": "app", "cpu": 3, "memory": 12, "net": 100}]
+            return [{
+                "id": "cid", "system": "sys1", "name": "app",
+                "cpu": 3, "memory": 12, "net": 100,
+                "updated": int((self.now - 30) * 1000),
+            }]
         if collection == "smart_devices":
             return [
                 {
@@ -1370,7 +1374,8 @@ def test_unfresh_system_does_not_expose_saved_runtime_states():
     m = exporter.PrometheusText()
     labels = {"system": "alpha", "system_id": "sys1"}
     exporter.BeszelCollector.emit_containers(
-        m, labels, [{"name": "app", "status": "Up 4 hours"}], [], emit_dynamic=False
+        m, labels, [{"name": "app", "status": "Up 4 hours"}], [],
+        emit_dynamic=False, now=0.0
     )
     exporter.BeszelCollector.emit_smart(
         m, labels, [{"name": "/dev/sda", "serial": "d", "state": "FAILED"}],
@@ -1413,6 +1418,7 @@ def test_duplicate_warning_once_per_metric_process_not_per_scrape(monkeypatch, c
 
 
 def test_stale_container_info_omits_ports_but_preserves_identity():
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
     labels = {"system": "host-a", "system_id": "sys1"}
     container = {
         "id": "cid",
@@ -1421,10 +1427,11 @@ def test_stale_container_info_omits_ports_but_preserves_identity():
         "ports": "8080/tcp",
         "image": "example/app:v2",
         "cpu": 20,
+        "updated": int((now - 30) * 1000),
     }
     fresh = exporter.PrometheusText()
     exporter.BeszelCollector.emit_containers(
-        fresh, labels, [container], [], emit_dynamic=True
+        fresh, labels, [container], [], emit_dynamic=True, now=now
     )
     fresh_info = next(
         line for line in fresh.render().splitlines()
@@ -1435,7 +1442,7 @@ def test_stale_container_info_omits_ports_but_preserves_identity():
 
     stale = exporter.PrometheusText()
     exporter.BeszelCollector.emit_containers(
-        stale, labels, [container], [], emit_dynamic=False
+        stale, labels, [container], [], emit_dynamic=False, now=now
     )
     stale_info = next(
         line for line in stale.render().splitlines()
@@ -1446,6 +1453,95 @@ def test_stale_container_info_omits_ports_but_preserves_identity():
     assert "ports=" not in stale_info
     assert "status=" not in stale_info
     assert "beszel_container_cpu_usage_percent" not in stale.render()
+
+
+@pytest.mark.parametrize(
+    ("updated_age", "expected_fresh"),
+    [
+        (30, True),
+        (180, True),  # Inclusive freshness boundary
+        (181, False),
+        (600, False),  # Removed 10 minutes ago, host still fresh
+        (None, False),  # Older agents missing per-container updated
+    ],
+)
+def test_container_updated_controls_all_dynamic_series(updated_age, expected_fresh):
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
+    container = {
+        "id": "cid", "name": "app", "image": "example/app:v2",
+        "status": "Up 3 hours", "ports": "8080/tcp",
+        "cpu": 20, "memory": 256, "net": 1000,
+        "health": 1, "updatable": True,
+    }
+    if updated_age is not None:
+        container["updated"] = int((now - updated_age) * 1000)
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_containers(
+        metrics,
+        {"system": "source-a", "system_id": "sys1"},
+        [container],
+        [{"n": "app", "b": [100, 200]}],
+        emit_dynamic=True,
+        now=now,
+    )
+    info = next(
+        line for line in metrics.render().splitlines()
+        if line.startswith("beszel_container_info{")
+    )
+    assert 'container="app"' in info
+    assert 'container_id="cid"' in info
+    assert 'image="example/app:v2"' in info
+    operational = set(metrics.families) - {"beszel_container_info"}
+    if expected_fresh:
+        assert 'status="running"' in info
+        assert 'ports="8080/tcp"' in info
+        assert operational == {
+            "beszel_container_cpu_usage_percent",
+            "beszel_container_memory_used_bytes",
+            "beszel_container_network_combined_bytes_per_second",
+            "beszel_container_health_state",
+            "beszel_container_update_available",
+            "beszel_container_network_bytes_per_second",
+        }
+    else:
+        assert "status=" not in info
+        assert "ports=" not in info
+        assert operational == set()
+
+
+def test_stale_container_row_on_fresh_host_exposes_only_identity_info(monkeypatch):
+    class StaleContainerAPI(FakeAPI):
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "containers":
+                rows[0].update({
+                    "updated": int((self.now - 600) * 1000),
+                    "status": "Up 3 hours",
+                    "ports": "8080/tcp",
+                    "health": 1,
+                    "updatable": True,
+                })
+            return rows
+
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    output = exporter.BeszelCollector(
+        api=StaleContainerAPI(now), clock=lambda: now
+    ).collect()
+    assert "beszel_exporter_up 1" in output
+    assert "beszel_system_cpu_usage_percent" in output  # Host is fresh.
+    info = next(
+        line for line in output.splitlines()
+        if line.startswith("beszel_container_info{")
+    )
+    assert 'container="app"' in info
+    assert 'container_id="cid"' in info
+    assert "status=" not in info
+    assert "ports=" not in info
+    assert not any(
+        line.startswith("beszel_container_") and not line.startswith("beszel_container_info")
+        for line in output.splitlines() if not line.startswith("#")
+    )
 
 
 def test_duplicate_warning_includes_first_system_id_debug_identifies_other_hosts(caplog):

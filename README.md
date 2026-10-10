@@ -555,7 +555,17 @@ identity labels, never model or firmware.
 
 Container image, container ID, status and port strings are similarly restricted
 to `beszel_container_info`. `status` and `ports` are included only when
-the host has fresh system statistics, and the Hub outage fallback retains only
+**both** the source host has fresh system statistics **and** the individual
+`containers.updated` timestamp is no older than `MAX_STATS_AGE_SECONDS`
+(default 180 seconds). Beszel stores this field as Unix milliseconds and
+refreshes it on each container upsert. Removed containers can remain in the Hub
+database, and older agents may stop updating `containers` while still
+sending host metrics. When a row is stale or lacks `updated`, only
+`beszel_container_info` with non-operational identity/image metadata remains:
+CPU, memory, network (including container history TX/RX), health and update
+metrics are omitted, as are the runtime `status` and `ports` labels.
+This absence is intentional: a retained database row is not proof that
+the container is still running. Hub outage fallback retains only allowlisted
 identity labels. Such changes in the label set create distinct Prometheus
 series; see the OpenObserve stale-marker verification instructions above.
 
