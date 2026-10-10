@@ -190,6 +190,19 @@ load, and the next attempt retries. If lock acquisition itself times out, only
 minimal exporter diagnostics are returned, without reading concurrent
 mutable collector state.
 
+**Lock-acquisition edge case:** a concurrent scrape may acquire the collector
+lock just before its own deadline expires. If the successful response cache has
+already expired, that request starts collection with virtually no remaining
+budget, immediately fails the deadline check, and caches the degraded
+`beszel_exporter_up=0` response for `FAILURE_CACHE_TTL` (default 5 seconds).
+During that interval subsequent scrapes can see the cached failure even if
+the earlier request completed normally. By contrast, a request that times out
+*while waiting for the lock* returns minimal exporter diagnostics **without
+overwriting the shared cache**. This timing race is unlikely with a single
+non-overlapping scraper, but can occur with parallel/redundant scrapers or slow
+collections. Keep scrape scheduling and timeouts aligned; do not interpret a
+single `up=0` in this situation as definitive proof of a Hub outage.
+
 Keep this budget below `scrape_timeout` (20 seconds in the supplied vmagent
 example); the default 15 seconds leaves ~5 seconds for HTTP response overhead.
 **Limitation:** the Python requests timeout is a socket connect/read inactivity
