@@ -507,10 +507,7 @@ def test_network_monitor_aggregates_skip_stale_data_and_zero_denominators():
         (labels["result"], labels["window"]): value
         for value, labels in samples(result, "beszel_network_monitor_probes")
     } == {("success", "1m"): 0, ("failure", "1m"): 0}
-    assert not any(
-        labels["window"] == "1m_avg"
-        for _, labels in result.families["beszel_network_monitor_response_seconds"]["samples"]
-    )
+    assert "beszel_network_monitor_response_seconds" not in result.families
     assert "beszel_network_monitor_packet_loss_percent" not in result.families
 
     stale = exporter.PrometheusText()
