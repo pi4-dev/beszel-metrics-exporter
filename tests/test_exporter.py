@@ -408,6 +408,126 @@ def test_collector_passes_independent_freshness_cutoffs_to_all_history_queries(m
         "network_monitor_stats": now - 600,
     }
 
+def history_coverage(output):
+    """Return collection-level wanted/found metrics from text exposition."""
+    observed = {}
+    for line in output.splitlines():
+        for metric in ("wanted", "found"):
+            prefix = f'beszel_exporter_history_records_{metric}{{collection="'
+            if line.startswith(prefix):
+                collection, value = line[len(prefix):].split('"} ', 1)
+                observed[(metric, collection)] = float(value)
+    return observed
+
+
+def test_history_coverage_reports_all_collections(monkeypatch):
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    result = exporter.BeszelCollector(api=FakeAPI(now), clock=lambda: now).collect()
+    assert "# TYPE beszel_exporter_history_records_wanted gauge" in result
+    assert "# TYPE beszel_exporter_history_records_found gauge" in result
+    assert history_coverage(result) == {
+        (metric, collection): 1.0
+        for metric in ("wanted", "found")
+        for collection in ("system_stats", "container_stats", "network_monitor_stats")
+    }
+    assert 'beszel_exporter_history_records_wanted{system=' not in result
+    assert 'beszel_exporter_history_records_found{system=' not in result
+
+
+def test_history_coverage_reports_missing_history(monkeypatch):
+    class EmptyHistoryAPI(FakeAPI):
+        def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
+            return {}
+
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    result = exporter.BeszelCollector(
+        api=EmptyHistoryAPI(now), clock=lambda: now
+    ).collect()
+    assert "beszel_exporter_up 1" in result
+    assert history_coverage(result) == {
+        (metric, collection): float(value)
+        for collection in ("system_stats", "container_stats", "network_monitor_stats")
+        for metric, value in (("wanted", 1), ("found", 0))
+    }
+    assert "beszel_network_monitor_stats_age_seconds" not in result
+
+
+def test_history_coverage_handles_zero_sources_and_partial_results(monkeypatch):
+    class PartialAPI(FakeAPI):
+        def __init__(self, now, empty=False):
+            super().__init__(now)
+            self.empty = empty
+
+        def records(self, collection, **kwargs):
+            if self.empty and collection in ("systems", "network_monitors"):
+                return []
+            rows = super().records(collection, **kwargs)
+            if collection == "systems":
+                rows.append({"id": "offline", "name": "offline", "status": "down"})
+            elif collection == "network_monitors":
+                rows.append({
+                    "id": "disabled", "system": "offline",
+                    "enabled": False, "interval": 600,
+                })
+            return rows
+
+        def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
+            if self.empty:
+                assert wanted_ids == set()
+                return {}
+            return super().latest_by_relation(
+                collection, relation_field, wanted_ids, **kwargs
+            )
+
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    partial = exporter.BeszelCollector(
+        api=PartialAPI(now), clock=lambda: now
+    ).collect()
+    assert history_coverage(partial) == {
+        (metric, collection): float(value)
+        for collection in ("system_stats", "container_stats", "network_monitor_stats")
+        for metric, value in (("wanted", 2), ("found", 1))
+    }
+    empty = exporter.BeszelCollector(
+        api=PartialAPI(now, empty=True), clock=lambda: now
+    ).collect()
+    assert "beszel_exporter_up 1" in empty
+    assert history_coverage(empty) == {
+        (metric, collection): 0.0
+        for collection in ("system_stats", "container_stats", "network_monitor_stats")
+        for metric in ("wanted", "found")
+    }
+
+
+def test_history_coverage_zero_found_on_optional_read_failure(monkeypatch):
+    class FailingHistoryAPI(FakeAPI):
+        def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
+            if collection == "network_monitor_stats":
+                raise RuntimeError("synthetic monitor-history query failure")
+            return super().latest_by_relation(
+                collection, relation_field, wanted_ids, **kwargs
+            )
+
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    result = exporter.BeszelCollector(
+        api=FailingHistoryAPI(now), clock=lambda: now
+    ).collect()
+    assert "beszel_exporter_up 1" in result
+    coverage = history_coverage(result)
+    assert coverage[("wanted", "network_monitor_stats")] == 1
+    assert coverage[("found", "network_monitor_stats")] == 0
+    assert coverage[("found", "system_stats")] == 1
+    assert coverage[("found", "container_stats")] == 1
+    assert (
+        'beszel_exporter_collection_errors_total{collection="network_monitor_stats"} 1'
+        in result
+    )
+
+
 def test_stale_stats_are_not_exported(monkeypatch):
     class FilteredStaleAPI(FakeAPI):
         def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):

@@ -752,10 +752,36 @@ beszel_exporter_up
 beszel_exporter_scrape_duration_seconds
 beszel_exporter_last_success_timestamp_seconds
 beszel_exporter_collection_errors_total{collection="..."}
+beszel_exporter_history_records_wanted{collection="..."}
+beszel_exporter_history_records_found{collection="..."}
 beszel_exporter_dropped_samples_total
 ```
 
-`beszel_exporter_collection_errors_total` increments when an optional Beszel collection cannot be read. Detailed causes are written to exporter logs.
+The two `beszel_exporter_history_records_*` metrics are **gauges**, with
+exactly three `collection` label values: `system_stats`, `container_stats`,
+and `network_monitor_stats`. `wanted` counts distinct system IDs (or monitor
+IDs for network-monitor history) and `found` counts distinct IDs with a
+matching recent `type="1m"` record. Both are emitted on every successful
+collection, including `0` when no source IDs exist or no rows were found.
+No host, system, or monitor labels are used.
+
+Compare the two numbers to detect unexpected loss of history, for example:
+
+```promql
+beszel_exporter_history_records_wanted{collection="network_monitor_stats"}
+-
+beszel_exporter_history_records_found{collection="network_monitor_stats"}
+```
+
+A gap alone is **not proof of a broken query**: offline systems and disabled
+or infrequently probed monitors may have no fresh history. A historical
+query failure also produces `found=0` but increments
+`beszel_exporter_collection_errors_total{collection="..."}`; inspect
+exporter logs. If the entire scrape fails, the history gauges are omitted
+rather than replayed from an earlier successful scrape.
+
+`beszel_exporter_collection_errors_total` increments when an optional
+Beszel collection cannot be read. Detailed causes are written to exporter logs.
 
 ## Breaking changes from the initial version
 
