@@ -366,7 +366,7 @@ def test_healthz_is_process_liveness_not_hub_readiness(monkeypatch):
     assert exporter.health_endpoint() == {"status": "ok"}
 
 
-@pytest.mark.parametrize("interval_seconds", [1, 30, 60, 539, 540, 600, 1200])
+@pytest.mark.parametrize("interval_seconds", [1, 30, 60, 299, 300, 450, 539, 540, 600, 1200])
 def test_monitor_interval_units_are_seconds(interval_seconds):
     # Upstream: Hub copies network_monitors.interval (integer) unchanged;
     # agent schedules probes with time.Duration(interval) * time.Second.
@@ -382,3 +382,36 @@ def test_monitor_interval_units_are_seconds(interval_seconds):
     value, labels = one(metrics, "beszel_network_monitor_interval_seconds")
     assert value == interval_seconds
     assert labels["monitor_id"] == "monitor-one"
+
+
+
+@pytest.mark.parametrize(
+    ("raw_interval", "expected_seconds"),
+    [
+        (None, 30),
+        ("", 30),
+        (0, 30),
+        ("0", 30),
+        ("not-a-number", 30),
+        (30, 30),
+        (60, 60),
+        (299, 299),
+        (300, 300),
+        (450, 450),
+    ],
+)
+def test_monitor_interval_uses_agent_effective_default(raw_interval, expected_seconds):
+    monitor = {"id": "mon1", "interval": raw_interval, "enabled": True}
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_network_monitors(
+        metrics, SYSTEM, [monitor], {}, source_fresh=False, now=0.0
+    )
+    assert one(metrics, "beszel_network_monitor_interval_seconds")[0] == expected_seconds
+
+
+def test_monitor_interval_missing_field_uses_30_seconds():
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_network_monitors(
+        metrics, SYSTEM, [{"id": "mon1"}], {}, source_fresh=False, now=0.0
+    )
+    assert one(metrics, "beszel_network_monitor_interval_seconds")[0] == 30
