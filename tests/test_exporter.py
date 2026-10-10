@@ -1092,6 +1092,7 @@ def test_empty_systems_after_password_relogin_visible_as_zero(monkeypatch, caplo
             self.headers = {}
             self.posts = 0
             self.gets = 0
+            self.systems_gets = 0
 
         def post(self, url, json, timeout):
             self.posts += 1
@@ -1099,6 +1100,8 @@ def test_empty_systems_after_password_relogin_visible_as_zero(monkeypatch, caplo
 
         def get(self, url, params, timeout):
             self.gets += 1
+            if url.endswith("/api/collections/systems/records"):
+                self.systems_gets += 1
             return BudgetResponse({"items": [], "totalPages": 1})
 
     api = exporter.BeszelAPI()
@@ -1107,7 +1110,7 @@ def test_empty_systems_after_password_relogin_visible_as_zero(monkeypatch, caplo
     assert "beszel_exporter_systems 0" in out
     assert "beszel_exporter_up 1" in out
     assert "empty after a fresh password login" in caplog.text
-    assert api.session.gets == 2
+    assert api.session.systems_gets == 2
     assert api.session.posts == 2
 
 
