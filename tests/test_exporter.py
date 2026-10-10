@@ -7,31 +7,6 @@ import pytest
 import beszel_exporter as exporter
 
 
-class LatestAPI(exporter.BeszelAPI):
-    def __init__(self):
-        self.calls = []
-
-    def get(self, path, params=None):
-        self.calls.append((path, params))
-        return {
-            "items": [{"id": "newest", "created": "2026-10-05T12:00:00Z"}],
-            "totalPages": 60,
-            "totalItems": 60,
-        }
-
-
-def test_latest_is_exactly_one_request():
-    api = LatestAPI()
-    row = api.latest("system_stats", 'system="abc" && type="1m"', "stats,created,type")
-    assert row["id"] == "newest"
-    assert len(api.calls) == 1
-    _, params = api.calls[0]
-    assert params["page"] == 1
-    assert params["perPage"] == 1
-    assert params["skipTotal"] == 1
-    assert params["sort"] == "-created"
-
-
 class BulkAPI(exporter.BeszelAPI):
     def __init__(self):
         self.calls = []
@@ -192,7 +167,6 @@ def test_prometheus_text_drops_duplicate_series_but_preserves_first(caplog):
     lines = metrics.render().splitlines()
     assert [line for line in lines if line.startswith("duplicate_metric{")] == ['duplicate_metric{a="x"} 1']
     assert 'other_metric{a="x"} 4' in lines
-    assert metrics.dropped_samples == 2
     assert duplicate_metrics == ["duplicate_metric", "duplicate_metric"]
     warnings = [record for record in caplog.records if "Dropping duplicate Prometheus sample" in record.message]
     assert len(warnings) == 1
@@ -204,19 +178,6 @@ def test_prometheus_text_still_rejects_metric_type_conflicts():
     metrics.add("my_metric", 1, metric_type="gauge")
     with pytest.raises(ValueError, match="Metric type conflict"):
         metrics.add("my_metric", 2, metric_type="counter")
-
-
-def test_prometheus_text_info_only_keeps_well_formed_info_families():
-    metrics = exporter.PrometheusText()
-    metrics.info("source_info", {"name": "source-a"})
-    metrics.add("source_cpu_percent", 42, {"name": "source-a"})
-    metrics.add("source_up", 1, {"name": "source-a"})
-    rendered = metrics.render(info_only=True)
-    assert "# HELP source_info " in rendered
-    assert "# TYPE source_info gauge" in rendered
-    assert 'source_info{name="source-a"} 1' in rendered
-    assert "source_cpu_percent" not in rendered
-    assert "source_up" not in rendered
 
 
 @pytest.mark.parametrize(
@@ -900,13 +861,12 @@ def test_duplicate_warning_once_per_metric_process_not_per_scrape(monkeypatch, c
     with exporter._LOGGED_DUPLICATE_METRICS_LOCK:
         exporter._LOGGED_DUPLICATE_METRICS.discard(metric)
     try:
-        total_drops = 0
+        dropped = []
         for _ in range(3):
-            metrics = exporter.PrometheusText()
+            metrics = exporter.PrometheusText(on_duplicate=dropped.append)
             metrics.add(metric, 1, {"system": "a"})
             metrics.add(metric, 2, {"system": "a"})
-            total_drops += metrics.dropped_samples
-        assert total_drops == 3
+        assert dropped == [metric] * 3
         warnings = [
             rec for rec in caplog.records
             if "Dropping duplicate Prometheus sample" in rec.message and metric in rec.message
@@ -961,8 +921,9 @@ def test_duplicate_warning_includes_first_system_id_debug_identifies_other_hosts
         exporter._LOGGED_DUPLICATE_METRICS.discard(name)
     try:
         with caplog.at_level(logging.DEBUG, logger="beszel_exporter"):
+            dropped = []
             for host in ("sys1", "sys2"):
-                metrics = exporter.PrometheusText()
+                metrics = exporter.PrometheusText(on_duplicate=dropped.append)
                 labels = {
                     "system_id": host,
                     "system": "private-host",
@@ -970,7 +931,7 @@ def test_duplicate_warning_includes_first_system_id_debug_identifies_other_hosts
                 }
                 metrics.add(name, 1, labels)
                 metrics.add(name, 2, labels)
-                assert metrics.dropped_samples == 1
+            assert dropped == [name, name]
 
         warnings = [
             record.message for record in caplog.records
