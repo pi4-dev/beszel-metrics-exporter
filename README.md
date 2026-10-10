@@ -99,7 +99,7 @@ For enabled monitors, use:
     and on(system_id) (beszel_system_up == 1)
   )
   and on(system_id, monitor_id)
-    (beszel_network_monitor_interval_seconds < 540)
+    (beszel_network_monitor_interval_seconds < 300)
 )
 unless on(system_id, monitor_id) beszel_network_monitor_stats_age_seconds
 ```
@@ -108,13 +108,24 @@ The monitor query deliberately excludes long-interval monitors to avoid false
 positives. Upstream Beszel runs monitor probes on the configured interval and
 persists `network_monitor_stats` history for new probe results; an interval
 greater than the freshness window can legitimately leave no `1m` record
-inside the window. The example uses `interval_seconds < 540` with the
-default `MAX_MONITOR_STATS_AGE_SECONDS=600` (90% of the freshness window).
-This leaves a 60-second margin for scheduling jitter, collection delays and
-startup stagger. **If you change the freshness limit, adjust `540` to 90%
-of the configured value.** Even a 10% margin cannot guarantee that missed or
-unusually delayed probes will never cause a false alarm. A missing series by
-itself does not prove a monitor failure.
+inside the window. The example uses **`interval_seconds < 300`** with the
+default `MAX_MONITOR_STATS_AGE_SECONDS=600`, restricting the alert to monitor
+intervals shorter than **half** the freshness window.
+
+On agent startup/restart, Beszel's `getStagger()` delays the first probe by
+approximately **0.5–1 × interval**. A probe just before restart can already
+be nearly one interval old; even with an immediate restart, the gap between
+stored probe records can approach **2 × interval**. The period without fresh
+history can therefore reach `max(0, 2 × interval - 600)` seconds (plus agent
+downtime and scheduling/collection delays). For example, at 450 seconds, the
+gap can approach 300 seconds, enough to make `for: 5m` borderline; at
+540 seconds, the gap can reach 480 seconds and trigger a false alert.
+
+Keeping the interval below half the cutoff prevents this specific restart
+gap under the idealized no-downtime model. **If you change the freshness limit,
+adjust `300` to half the configured value.** Prolonged agent downtime,
+missed probes or other delays can still trigger the alert. A missing series
+by itself does not prove a monitor failure.
 See [Beszel agent scheduling](https://github.com/henrygd/beszel/blob/main/agent/network_monitor_schedule.go)
 and [Hub stats persistence](https://github.com/henrygd/beszel/blob/main/internal/hub/systems/system.go).
 
@@ -579,12 +590,14 @@ port
 server
 ```
 
-`beszel_network_monitor_interval_seconds` uses the raw
-`network_monitors.interval` value **without conversion**, because Beszel
-stores it in **seconds**. Upstream, the
-[Hub maps the integer interval into the agent configuration](https://github.com/henrygd/beszel/blob/main/internal/hub/network_monitors.go)
+`beszel_network_monitor_interval_seconds` uses the value of
+`network_monitors.interval` **in seconds**. Upstream,
+[the Hub maps the integer interval into the agent configuration](https://github.com/henrygd/beszel/blob/main/internal/hub/network_monitors.go),
 and [the agent multiplies it by `time.Second`](https://github.com/henrygd/beszel/blob/main/agent/network_monitor_schedule.go).
-Thus the alert filter `< 540` above also uses seconds.
+When the stored interval is **0, missing or invalid**, the exporter reports
+the **effective default of 30 seconds**, matching the agent's fallback for
+intervals below one second. Other valid positive intervals are exported
+unchanged. The alert filter `< 300` above also uses seconds.
 
 Latency windows include, where available:
 
