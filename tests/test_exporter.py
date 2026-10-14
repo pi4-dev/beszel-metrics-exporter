@@ -794,7 +794,6 @@ def test_one_broken_system_does_not_publish_partial_metrics_or_fail_other_hosts(
                 collection, relation_field, wanted_ids, **kwargs
             )
             if collection == "system_stats":
-                rows["sys1"]["stats"]["g"] = {"gpu0": [1, 2, 3]}
                 rows["sys2"] = {
                     "system": "sys2",
                     "created": datetime.fromtimestamp(
@@ -806,6 +805,19 @@ def test_one_broken_system_does_not_publish_partial_metrics_or_fail_other_hosts(
 
     now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
     monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    original_emit = exporter.BeszelCollector.emit_system_stats
+
+    def broken_host_stats(metrics, labels, stats):
+        # Simulate an unexpected mapper exception after identity/host
+        # status metrics have already been staged for the broken host.
+        if labels["system_id"] == "sys1":
+            raise TypeError("synthetic malformed nested statistics")
+        return original_emit(metrics, labels, stats)
+
+    monkeypatch.setattr(
+        exporter.BeszelCollector, "emit_system_stats",
+        staticmethod(broken_host_stats),
+    )
     collector = exporter.BeszelCollector(
         api=OneBrokenAPI(now), clock=lambda: now
     )
