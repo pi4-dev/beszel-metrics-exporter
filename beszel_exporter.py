@@ -104,13 +104,14 @@ def bounded_request_timeout() -> float:
 def numeric(value: Any) -> float | int | None:
     if isinstance(value, bool):
         return int(value)
-    if isinstance(value, (int, float)):
-        return value if math.isfinite(float(value)) else None
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # Even a valid Python integer can be too large for a finite float.
         return None
-    return parsed if math.isfinite(parsed) else None
+    if not math.isfinite(parsed):
+        return None
+    return value if isinstance(value, (int, float)) else parsed
 
 
 def jwt_expires_at(token: str) -> float | None:
@@ -135,15 +136,15 @@ def jwt_expires_at(token: str) -> float | None:
 
 
 def decoded(value: Any, default: Any) -> Any:
-    if value is None:
-        return default
-    if isinstance(value, (dict, list)):
+    """Parse a JSON-shaped field without changing the caller's expected type."""
+    if isinstance(value, type(default)):
         return value
     if isinstance(value, str):
         try:
-            return json.loads(value)
-        except json.JSONDecodeError:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
             return default
+        return parsed if isinstance(parsed, type(default)) else default
     return default
 
 
@@ -514,6 +515,7 @@ class BeszelCollector:
         self.last_good_identity = ""
         self.last_success = 0.0
         self.collection_errors: defaultdict[str, int] = defaultdict(int)
+        self.system_errors_total = 0
         self.dropped_samples_total = 0
 
     def _record_dropped_sample(self, _metric_name: str) -> None:
@@ -636,6 +638,12 @@ class BeszelCollector:
                 help_text="Total optional Beszel collection read errors.",
             )
         metrics.add(
+            "beszel_exporter_system_errors_total",
+            self.system_errors_total,
+            metric_type="counter",
+            help_text="Total Beszel systems skipped because their data could not be mapped safely.",
+        )
+        metrics.add(
             "beszel_exporter_dropped_samples_total",
             self.dropped_samples_total,
             metric_type="counter",
@@ -646,7 +654,11 @@ class BeszelCollector:
     def _collect_data(self, now: float) -> tuple[str, str]:
         metrics = PrometheusText(on_duplicate=self._record_dropped_sample)
         systems = self.api.records("systems")
-        system_ids = {row.get("id") for row in systems if row.get("id")}
+        system_ids = {
+            row["id"]
+            for row in systems
+            if isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"]
+        }
         metrics.add(
             "beszel_exporter_systems",
             len(system_ids),
@@ -655,12 +667,17 @@ class BeszelCollector:
         up_ids = {
             row["id"]
             for row in systems
-            if row.get("id") and row.get("status") == "up"
+            if isinstance(row, dict)
+            and isinstance(row.get("id"), str)
+            and row["id"]
+            and row.get("status") == "up"
         }
 
         details = {
             row.get("system", row.get("id")): row
             for row in self.optional_records("system_details")
+            if isinstance(row, dict)
+            and isinstance(row.get("system", row.get("id")), str)
         }
         related = {
             "containers": self.optional_records("containers"),
@@ -674,17 +691,27 @@ class BeszelCollector:
         }
         for name, rows in related.items():
             for row in rows:
-                grouped[name][row.get("system", "")].append(row)
+                # Ignore malformed unrelated rows instead of corrupting the
+                # entire scrape before the per-system isolation boundary.
+                if not isinstance(row, dict) or not isinstance(row.get("system"), str):
+                    self.collection_errors[name] += 1
+                    logger.warning("Skipping invalid Beszel %s record", name)
+                    continue
+                grouped[name][row["system"]].append(row)
 
         monitor_ids = {
-            row.get("id")
+            row["id"]
             for row in related["network_monitors"]
-            if row.get("id")
+            if isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"]
         }
         enabled_monitor_ids = {
             row["id"]
             for row in related["network_monitors"]
-            if row.get("id") and row.get("enabled") and row.get("system") in up_ids
+            if isinstance(row, dict)
+            and isinstance(row.get("id"), str)
+            and row["id"]
+            and row.get("enabled")
+            and row.get("system") in up_ids
         }
         system_stats = self.optional_latest_by_relation(
             "system_stats",
@@ -735,63 +762,85 @@ class BeszelCollector:
 
         for system in systems:
             check_scrape_deadline()
-            system_id = system.get("id")
-            if not system_id:
+            if not isinstance(system, dict) or not isinstance(system.get("id"), str):
+                self.system_errors_total += 1
+                logger.warning("Skipping malformed Beszel system entry")
                 continue
-            labels = {"system": system.get("name", system_id), "system_id": system_id}
-            system_up = system.get("status") == "up"
-
-            stats_record = system_stats.get(system_id)
-            stats_age = record_age_seconds(stats_record, now)
-            if stats_age is not None:
-                metrics.add(
-                    "beszel_system_stats_age_seconds",
-                    stats_age,
-                    labels,
-                    help_text="Age of the newest Beszel system_stats record.",
+            system_id = system["id"]
+            if not system_id:
+                self.system_errors_total += 1
+                logger.warning("Skipping Beszel system entry without an id")
+                continue
+            # Stage a whole system before committing its metrics: a failure
+            # midway through one host cannot publish a half-updated snapshot.
+            system_metrics = PrometheusText(on_duplicate=self._record_dropped_sample)
+            try:
+                labels = {"system": system.get("name", system_id), "system_id": system_id}
+                system_up = system.get("status") == "up"
+    
+                stats_record = system_stats.get(system_id)
+                stats_age = record_age_seconds(stats_record, now)
+                if stats_age is not None:
+                    system_metrics.add(
+                        "beszel_system_stats_age_seconds",
+                        stats_age,
+                        labels,
+                        help_text="Age of the newest Beszel system_stats record.",
+                    )
+                stats_fresh = system_up and stats_age is not None and stats_age <= MAX_STATS_AGE_SECONDS
+                self.emit_system_record(
+                    system_metrics, labels, system, details.get(system_id), system_up,
+                    include_status=stats_fresh or not system_up,
                 )
-            stats_fresh = system_up and stats_age is not None and stats_age <= MAX_STATS_AGE_SECONDS
-            self.emit_system_record(
-                metrics, labels, system, details.get(system_id), system_up,
-                include_status=stats_fresh or not system_up,
-            )
-            if stats_fresh and stats_record:
-                self.emit_system_stats(metrics, labels, decoded(stats_record.get("stats"), {}))
-
-            container_record = container_stats.get(system_id)
-            container_age = record_age_seconds(container_record, now)
-            if container_age is not None:
-                metrics.add(
-                    "beszel_container_stats_age_seconds",
-                    container_age,
+                if stats_fresh and stats_record:
+                    self.emit_system_stats(system_metrics, labels, decoded(stats_record.get("stats"), {}))
+    
+                container_record = container_stats.get(system_id)
+                container_age = record_age_seconds(container_record, now)
+                if container_age is not None:
+                    system_metrics.add(
+                        "beszel_container_stats_age_seconds",
+                        container_age,
+                        labels,
+                        help_text="Age of the newest Beszel container_stats record.",
+                    )
+                history_fresh = system_up and container_age is not None and container_age <= MAX_STATS_AGE_SECONDS
+                history = decoded(container_record.get("stats"), []) if history_fresh and container_record else []
+    
+                self.emit_containers(
+                    system_metrics,
                     labels,
-                    help_text="Age of the newest Beszel container_stats record.",
+                    grouped["containers"][system_id],
+                    history,
+                    emit_dynamic=stats_fresh,
+                    now=now,
                 )
-            history_fresh = system_up and container_age is not None and container_age <= MAX_STATS_AGE_SECONDS
-            history = decoded(container_record.get("stats"), []) if history_fresh and container_record else []
-
-            self.emit_containers(
-                metrics,
-                labels,
-                grouped["containers"][system_id],
-                history,
-                emit_dynamic=stats_fresh,
-                now=now,
-            )
-            self.emit_smart(metrics, labels, grouped["smart_devices"][system_id], emit_dynamic=stats_fresh)
-            self.emit_systemd(
-                metrics, labels, grouped["systemd_services"][system_id],
-                emit_dynamic=stats_fresh, now=now,
-            )
-            self.emit_storage_pools(metrics, labels, grouped["zfs_pools"][system_id], emit_dynamic=stats_fresh)
-            self.emit_network_monitors(
-                metrics,
-                labels,
-                grouped["network_monitors"][system_id],
-                monitor_stats,
-                stats_fresh,
-                now,
-            )
+                self.emit_smart(system_metrics, labels, grouped["smart_devices"][system_id], emit_dynamic=stats_fresh)
+                self.emit_systemd(
+                    system_metrics, labels, grouped["systemd_services"][system_id],
+                    emit_dynamic=stats_fresh, now=now,
+                )
+                self.emit_storage_pools(system_metrics, labels, grouped["zfs_pools"][system_id], emit_dynamic=stats_fresh)
+                self.emit_network_monitors(
+                    system_metrics,
+                    labels,
+                    grouped["network_monitors"][system_id],
+                    monitor_stats,
+                    stats_fresh,
+                    now,
+                )
+            except ScrapeDeadlineExceeded:
+                raise
+            except Exception:
+                self.system_errors_total += 1
+                logger.exception("Failed to map Beszel system_id=%s; skipping host", system_id)
+                continue
+            for name, family in system_metrics.families.items():
+                for value, sample_labels in family["samples"]:
+                    metrics.add(
+                        name, value, sample_labels,
+                        metric_type=family["type"], help_text=family["help"],
+                    )
         check_scrape_deadline()
         full = metrics.render()
         check_scrape_deadline()
@@ -1235,8 +1284,10 @@ class BeszelCollector:
                         metric_type="counter",
                     )
             metrics.add("beszel_smart_power_cycles_total", device.get("cycles"), data_labels, metric_type="counter")
-            state = str(device.get("state", "")).upper()
-            if state:
+            raw_state = device.get("state")
+            state = raw_state.strip().upper() if isinstance(raw_state, str) else ""
+            # UNKNOWN, null and vendor-specific values are not SMART failures.
+            if state in ("PASSED", "FAILED"):
                 metrics.add("beszel_smart_passed", 1 if state == "PASSED" else 0, data_labels)
             for attribute in decoded(device.get("attributes"), []):
                 if not isinstance(attribute, dict):
