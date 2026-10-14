@@ -254,27 +254,6 @@ def test_prometheus_text_still_rejects_metric_type_conflicts():
 
 
 @pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("Up 2 minutes", "running"),
-        ("Up About an hour", "running"),
-        ("Up 3 hours (healthy)", "running"),
-        ("Up 3 hours (unhealthy)", "running"),
-        ("Up 4 hours (Paused)", "paused"),
-        ("Exited (0) 2 hours ago", "exited"),
-        ("Exited (137) 20 seconds ago", "exited"),
-        ("Restarting (1) 5 seconds ago", "restarting"),
-        ("Created", "created"),
-        ("Dead", "dead"),
-        ("Removing", "removing"),
-        ("Running", "running"),
-        ("", "unknown"),
-        (None, "unknown"),
-        ("Up 2 minutes; unique-value=123", "running"),
-        ("unexpected 123456", "unknown"),
-    ],
-)
-@pytest.mark.parametrize(
     ("variable", "value"),
     [
         ("REQUEST_TIMEOUT", "0"), ("REQUEST_TIMEOUT", "-1"),
@@ -316,6 +295,27 @@ def test_zero_cache_ttls_are_valid_at_import(variable):
     assert process.returncode == 0, process.stderr
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Up 2 minutes", "running"),
+        ("Up About an hour", "running"),
+        ("Up 3 hours (healthy)", "running"),
+        ("Up 3 hours (unhealthy)", "running"),
+        ("Up 4 hours (Paused)", "paused"),
+        ("Exited (0) 2 hours ago", "exited"),
+        ("Exited (137) 20 seconds ago", "exited"),
+        ("Restarting (1) 5 seconds ago", "restarting"),
+        ("Created", "created"),
+        ("Dead", "dead"),
+        ("Removing", "removing"),
+        ("Running", "running"),
+        ("", "unknown"),
+        (None, "unknown"),
+        ("Up 2 minutes; unique-value=123", "running"),
+        ("unexpected 123456", "unknown"),
+    ],
+)
 def test_normalized_container_status_is_bounded(raw, expected):
     assert exporter.normalized_container_status(raw) == expected
 
