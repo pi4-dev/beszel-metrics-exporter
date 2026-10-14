@@ -143,6 +143,34 @@ def test_smart_passed_emitted_only_for_explicit_passed_or_failed(smart_state, ex
         assert one(metrics, "beszel_smart_passed")[0] == expected
 
 
+def test_missing_numeric_label_fields_never_render_none_string():
+    monitors = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_network_monitors(
+        monitors, SYSTEM, [{"id": "mon", "port": None, "enabled": False}],
+        {}, source_fresh=False, now=0.0,
+    )
+    assert 'port=""' in monitors.render()
+    assert 'port="None"' not in monitors.render()
+
+    smart = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_smart(
+        smart, SYSTEM, [{
+            "name": "/dev/sda", "serial": "disk1",
+            "attributes": [{"id": None, "n": "Temperature", "v": 21}],
+        }], emit_dynamic=True,
+    )
+    assert 'attribute_id=""' in smart.render()
+    assert 'attribute_id="None"' not in smart.render()
+    zero = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_smart(
+        zero, SYSTEM, [{
+            "name": "/dev/sda", "serial": "disk1",
+            "attributes": [{"id": 0, "n": "Vendor", "v": 1}],
+        }], emit_dynamic=True,
+    )
+    assert 'attribute_id="0"' in zero.render()
+
+
 def test_gpu_model_name_only_on_info_not_numeric_series():
     stats = {
         "g": {

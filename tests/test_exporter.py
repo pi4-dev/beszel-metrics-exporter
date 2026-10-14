@@ -274,6 +274,48 @@ def test_prometheus_text_still_rejects_metric_type_conflicts():
         ("unexpected 123456", "unknown"),
     ],
 )
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("REQUEST_TIMEOUT", "0"), ("REQUEST_TIMEOUT", "-1"),
+        ("REQUEST_TIMEOUT", "inf"), ("REQUEST_TIMEOUT", "bogus"),
+        ("SCRAPE_BUDGET_SECONDS", "0"), ("BULK_PAGE_SIZE", "0"),
+        ("BULK_PAGE_SIZE", "-100"), ("BULK_PAGE_SIZE", "bad"),
+        ("BULK_MAX_PAGES", "0"), ("CACHE_TTL", "-1"),
+        ("FAILURE_CACHE_TTL", "-1"), ("MAX_STATS_AGE_SECONDS", "0"),
+        ("MAX_MONITOR_STATS_AGE_SECONDS", "nan"),
+        ("MAX_SYSTEMD_AGE_SECONDS", "-30"),
+        ("LISTEN_PORT", "0"), ("LISTEN_PORT", "65536"),
+    ],
+)
+def test_invalid_environment_rejected_during_import(variable, value):
+    import os
+    import subprocess
+    import sys
+
+    process = subprocess.run(
+        [sys.executable, "-c", "import beszel_exporter"],
+        env=dict(os.environ, **{variable: value}),
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert process.returncode != 0
+    assert variable in process.stderr
+
+
+@pytest.mark.parametrize("variable", ["CACHE_TTL", "FAILURE_CACHE_TTL"])
+def test_zero_cache_ttls_are_valid_at_import(variable):
+    import os
+    import subprocess
+    import sys
+
+    process = subprocess.run(
+        [sys.executable, "-c", "import beszel_exporter"],
+        env=dict(os.environ, **{variable: "0"}),
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert process.returncode == 0, process.stderr
+
+
 def test_normalized_container_status_is_bounded(raw, expected):
     assert exporter.normalized_container_status(raw) == expected
 
@@ -433,6 +475,118 @@ def history_coverage(output):
                 collection, value = line[len(prefix):].split('"} ', 1)
                 observed[(metric, collection)] = float(value)
     return observed
+
+
+def test_container_history_coverage_excludes_up_hosts_without_containers(monkeypatch):
+    class MixedHosts(FakeAPI):
+        def __init__(self, now, with_stale=False):
+            super().__init__(now)
+            self.with_stale = with_stale
+            self.queries = {}
+
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "systems":
+                rows.append({"id": "sys2", "name": "no-docker", "status": "up"})
+            if collection == "containers":
+                if self.with_stale:
+                    rows.append({
+                        "id": "old-container", "system": "sys2", "name": "old",
+                        "updated": int((self.now - 600) * 1000),
+                    })
+                else:
+                    rows.clear()
+            return rows
+
+        def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
+            self.queries[collection] = set(wanted_ids)
+            rows = super().latest_by_relation(
+                collection, relation_field, wanted_ids, **kwargs
+            )
+            if collection == "container_stats":
+                rows["sys2"] = {
+                    "created": datetime.fromtimestamp(
+                        self.now - 20, tz=timezone.utc
+                    ).isoformat(),
+                }
+            return rows
+
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    for stale in (False, True):
+        api = MixedHosts(now, with_stale=stale)
+        result = exporter.BeszelCollector(api=api, clock=lambda: now).collect()
+        observed = history_coverage(result)
+        assert observed[("wanted", "system_stats")] == 2
+        assert observed[("wanted", "container_stats")] == 0
+        assert observed[("found", "container_stats")] == 0
+        assert api.queries["container_stats"] == {"sys1", "sys2"}
+
+
+def test_container_history_coverage_counts_only_active_container_hosts(monkeypatch):
+    class MixedHosts(FakeAPI):
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "systems":
+                rows.append({"id": "sys2", "name": "no-docker", "status": "up"})
+            return rows
+
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    result = exporter.BeszelCollector(api=MixedHosts(now), clock=lambda: now).collect()
+    coverage = history_coverage(result)
+    assert coverage[("wanted", "system_stats")] == 2
+    assert coverage[("wanted", "container_stats")] == 1
+    assert coverage[("found", "container_stats")] == 1
+
+
+def test_container_history_coverage_reports_missing_live_history(monkeypatch):
+    class NoHistory(FakeAPI):
+        def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
+            if collection == "container_stats":
+                return {}
+            return super().latest_by_relation(
+                collection, relation_field, wanted_ids, **kwargs
+            )
+
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    result = exporter.BeszelCollector(api=NoHistory(now), clock=lambda: now).collect()
+    coverage = history_coverage(result)
+    assert coverage[("wanted", "container_stats")] == 1
+    assert coverage[("found", "container_stats")] == 0
+
+
+def test_host_status_remains_stable_on_stale_stats_and_wifi_disappears(monkeypatch):
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    fresh = exporter.BeszelCollector(api=FakeAPI(now), clock=lambda: now).collect()
+    stale = exporter.BeszelCollector(
+        api=FakeAPI(now, stale=True), clock=lambda: now
+    ).collect()
+    def host_info(text):
+        return next(
+            line for line in text.splitlines()
+            if line.startswith("beszel_system_info{")
+        )
+
+    assert host_info(fresh) == host_info(stale)
+    assert 'status="up"' in host_info(stale)
+    assert 'ssid="HomeSSID"' in fresh
+    assert "beszel_system_wifi_info{" not in stale
+
+    class Offline(FakeAPI):
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "systems":
+                rows[0]["status"] = "down"
+            return rows
+
+    offline = exporter.BeszelCollector(
+        api=Offline(now), clock=lambda: now
+    ).collect()
+    assert 'status="down"' in host_info(offline)
+    assert "beszel_system_wifi_info{" not in offline
 
 
 def test_history_coverage_reports_all_collections(monkeypatch):
