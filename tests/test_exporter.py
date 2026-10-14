@@ -827,9 +827,15 @@ def test_one_broken_system_does_not_publish_partial_metrics_or_fail_other_hosts(
     assert "beszel_exporter_system_errors_total 1" in rendered
     assert collector.system_errors_total == 1
     assert 'beszel_system_cpu_usage_percent{system="healthy",system_id="sys2"} 22' in rendered
-    assert 'beszel_system_info{system="healthy",system_id="sys2"' in rendered
+    info_lines = [
+        line for line in rendered.splitlines()
+        if line.startswith("beszel_system_info{")
+    ]
+    assert len(info_lines) == 1
+    assert 'system="healthy"' in info_lines[0]
+    assert 'system_id="sys2"' in info_lines[0]
+    assert 'system_id="sys1"' not in info_lines[0]
     assert 'beszel_system_cpu_usage_percent{system="source-a",system_id="sys1"}' not in rendered
-    assert 'beszel_system_info{system="source-a",system_id="sys1"' not in rendered
     assert "Failed to map Beszel system_id=sys1" in caplog.text
     second = collector.collect()
     assert "beszel_exporter_system_errors_total 2" in second
