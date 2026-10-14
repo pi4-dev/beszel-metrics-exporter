@@ -705,6 +705,145 @@ def test_stale_stats_are_not_exported(monkeypatch):
     assert "status=" not in system_info
 
 
+@pytest.mark.parametrize(
+    ("value", "default", "expected"),
+    [
+        ({"a": 1}, {}, {"a": 1}),
+        ([1, 2], [], [1, 2]),
+        ('{"a": 1}', {}, {"a": 1}),
+        ("[1, 2]", [], [1, 2]),
+        ([1, 2], {}, {}),
+        ({"a": 1}, [], []),
+        ("[1, 2]", {}, {}),
+        ('{"a": 1}', [], []),
+        ('"not-a-dict"', {}, {}),
+        ("123", {}, {}),
+        ("null", {}, {}),
+        ("false", {}, {}),
+        ("123", [], []),
+        ('"not-a-list"', [], []),
+        ("{}", [], []),
+        ("invalid-json", {}, {}),
+        (None, {}, {}),
+    ],
+)
+def test_decoded_rejects_values_with_unexpected_json_shape(value, default, expected):
+    assert exporter.decoded(value, default) == expected
+
+
+def test_numeric_rejects_overflow_and_nonfinite_input():
+    assert exporter.numeric(10**400) is None
+    assert exporter.numeric(-(10**400)) is None
+    assert exporter.numeric(float("inf")) is None
+    assert exporter.numeric("1e500") is None
+    assert exporter.numeric(42) == 42
+    assert exporter.numeric("42") == 42.0
+
+
+def test_malformed_nested_json_shapes_do_not_abort_healthy_system_scrape(monkeypatch):
+    class WrongShapes(FakeAPI):
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "systems":
+                rows[0]["info"] = '["unexpected", "list"]'
+            elif collection == "smart_devices":
+                rows[0]["attributes"] = '{"not": "an array"}'
+            return rows
+
+        def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
+            result = super().latest_by_relation(
+                collection, relation_field, wanted_ids, **kwargs
+            )
+            if collection == "system_stats":
+                stats = result["sys1"]["stats"]
+                stats.update({
+                    "t": '["unexpected"]', "f": "100",
+                    "ni": '[{"eth0": []}]', "g": '["broken"]',
+                    "efs": "false", "wf": '["invalid"]',
+                    "bats": "null",
+                })
+            if collection == "container_stats":
+                result["sys1"]["stats"] = '{"not": "an array"}'
+            return result
+
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    rendered = exporter.BeszelCollector(
+        api=WrongShapes(now), clock=lambda: now
+    ).collect()
+    assert "beszel_exporter_up 1" in rendered
+    assert "beszel_exporter_system_errors_total 0" in rendered
+    assert 'beszel_system_cpu_usage_percent{system="source-a",system_id="sys1"} 10' in rendered
+    assert "beszel_system_temperature_celsius{" not in rendered
+    assert "beszel_system_network_interface_bytes_per_second{" not in rendered
+    assert "beszel_gpu_usage_percent{" not in rendered
+
+
+def test_one_broken_system_does_not_publish_partial_metrics_or_fail_other_hosts(
+    monkeypatch, caplog
+):
+    class OneBrokenAPI(FakeAPI):
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "systems":
+                rows.append({"id": "sys2", "name": "healthy", "status": "up"})
+            return rows
+
+        def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
+            rows = super().latest_by_relation(
+                collection, relation_field, wanted_ids, **kwargs
+            )
+            if collection == "system_stats":
+                rows["sys1"]["stats"]["g"] = {"gpu0": [1, 2, 3]}
+                rows["sys2"] = {
+                    "system": "sys2",
+                    "created": datetime.fromtimestamp(
+                        self.now - 30, tz=timezone.utc
+                    ).isoformat(),
+                    "stats": {"cpu": 22, "m": 16},
+                }
+            return rows
+
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    collector = exporter.BeszelCollector(
+        api=OneBrokenAPI(now), clock=lambda: now
+    )
+    rendered = collector.collect()
+    assert "beszel_exporter_up 1" in rendered
+    assert "beszel_exporter_systems 2" in rendered
+    assert "beszel_exporter_system_errors_total 1" in rendered
+    assert collector.system_errors_total == 1
+    assert 'beszel_system_cpu_usage_percent{system="healthy",system_id="sys2"} 22' in rendered
+    assert 'beszel_system_info{system="healthy",system_id="sys2"' in rendered
+    assert 'beszel_system_cpu_usage_percent{system="source-a",system_id="sys1"}' not in rendered
+    assert 'beszel_system_info{system="source-a",system_id="sys1"' not in rendered
+    assert "Failed to map Beszel system_id=sys1" in caplog.text
+    second = collector.collect()
+    assert "beszel_exporter_system_errors_total 2" in second
+
+
+def test_non_object_system_entry_is_skipped_and_counted(monkeypatch):
+    class BrokenSystemList(FakeAPI):
+        def records(self, collection, **kwargs):
+            rows = super().records(collection, **kwargs)
+            if collection == "systems":
+                rows.extend([None, ["garbage"], {"status": "up"}])
+            elif collection == "network_monitors":
+                rows.append(["bad-monitor"])
+            return rows
+
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(exporter, "CACHE_TTL", 0)
+    rendered = exporter.BeszelCollector(
+        api=BrokenSystemList(now), clock=lambda: now
+    ).collect()
+    assert "beszel_exporter_up 1" in rendered
+    assert "beszel_exporter_systems 1" in rendered
+    assert "beszel_exporter_system_errors_total 3" in rendered
+    assert 'beszel_exporter_collection_errors_total{collection="network_monitors"} 1' in rendered
+
+
 def test_fresh_stats_have_no_duplicate_fs_or_wifi_samples(monkeypatch):
     now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc).timestamp()
     monkeypatch.setattr(exporter, "CACHE_TTL", 0)

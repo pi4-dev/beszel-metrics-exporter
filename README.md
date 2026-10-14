@@ -759,6 +759,10 @@ current
 Numeric SMART series do not include `model` or `firmware` labels. Those fields are present only on `beszel_smart_device_info`, preventing a firmware upgrade from creating new copies of every SMART attribute time series.
 
 SMART power-on time is exported as seconds (`beszel_smart_power_on_seconds_total`).
+`beszel_smart_passed` is emitted only when the source SMART `state`
+is explicitly `PASSED` (value 1) or `FAILED` (value 0), ignoring case and
+surrounding whitespace. Missing, null, `UNKNOWN` and vendor-specific
+states omit the metric rather than triggering a false failure alert.
 The former hours-based series is optional under `LEGACY_UNITS=true`.
 
 SMART raw human-readable strings are not exported as labels.
@@ -832,6 +836,7 @@ beszel_exporter_systems
 beszel_exporter_scrape_duration_seconds
 beszel_exporter_last_success_timestamp_seconds
 beszel_exporter_collection_errors_total{collection="..."}
+beszel_exporter_system_errors_total
 beszel_exporter_history_records_wanted{collection="..."}
 beszel_exporter_history_records_found{collection="..."}
 beszel_exporter_dropped_samples_total
@@ -867,6 +872,23 @@ alert. A historical query failure also produces `found=0` but increments
 exporter logs. If the entire scrape fails, the history gauges are omitted
 rather than replayed from an earlier successful scrape.
 
+The exporter isolates per-system mapping errors. A malformed host record can
+be skipped without turning `beszel_exporter_up` to zero or suppressing other
+hosts. Its partially rendered metrics are discarded, and the persistent,
+unlabeled `beszel_exporter_system_errors_total` counter increases for each
+skipped system, including non-object rows or rows without valid IDs:
+
+```promql
+increase(beszel_exporter_system_errors_total[15m]) > 0
+```
+
+Check exporter logs for the affected `system_id`. `beszel_exporter_up=1`
+means collection succeeded overall; it does not guarantee that every source
+record was usable. Unexpected JSON types in structured Beszel fields (such
+as `info`, `stats.t`, `stats.ni`) are ignored as absent instead of crashing
+the collection. Malformed related collection rows are counted in
+`beszel_exporter_collection_errors_total` for their collection.
+
 Monitor unexpectedly empty source inventories with:
 
 ```promql
@@ -881,7 +903,8 @@ successful systems queries (including empty results), but is **absent** on
 failed scrapes; alert separately on `beszel_exporter_up == 0`.
 
 `beszel_exporter_collection_errors_total` increments when an optional
-Beszel collection cannot be read. Detailed causes are written to exporter logs.
+Beszel collection cannot be read or contains invalid non-object/unalignable
+entries. Detailed causes are written to exporter logs.
 
 ## Breaking changes from the initial version
 

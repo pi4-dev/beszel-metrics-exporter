@@ -109,6 +109,40 @@ def test_smart_power_on_time_and_attributes_use_base_units(monkeypatch):
     assert one(legacy, "beszel_smart_power_on_seconds_total")[0] == 5400
 
 
+@pytest.mark.parametrize(
+    ("smart_state", "expected"),
+    [
+        ("PASSED", 1),
+        ("passed", 1),
+        (" Passed ", 1),
+        ("FAILED", 0),
+        ("failed", 0),
+        (None, None),
+        ("UNKNOWN", None),
+        ("UNKNOWN (NVMe)", None),
+        ("WARN", None),
+        ("", None),
+        (42, None),
+    ],
+)
+def test_smart_passed_emitted_only_for_explicit_passed_or_failed(smart_state, expected):
+    device = {
+        "name": "/dev/sda",
+        "serial": "ABC",
+        "state": smart_state,
+        "capacity": 1000,
+    }
+    metrics = exporter.PrometheusText()
+    exporter.BeszelCollector.emit_smart(
+        metrics, SYSTEM, [device], emit_dynamic=True
+    )
+    assert "beszel_smart_device_info" in metrics.families
+    if expected is None:
+        assert "beszel_smart_passed" not in metrics.families
+    else:
+        assert one(metrics, "beszel_smart_passed")[0] == expected
+
+
 def test_gpu_model_name_only_on_info_not_numeric_series():
     stats = {
         "g": {
