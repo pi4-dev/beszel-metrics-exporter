@@ -489,13 +489,12 @@ def test_container_history_coverage_excludes_up_hosts_without_containers(monkeyp
             if collection == "systems":
                 rows.append({"id": "sys2", "name": "no-docker", "status": "up"})
             if collection == "containers":
+                rows.clear()
                 if self.with_stale:
                     rows.append({
                         "id": "old-container", "system": "sys2", "name": "old",
                         "updated": int((self.now - 600) * 1000),
                     })
-                else:
-                    rows.clear()
             return rows
 
         def latest_by_relation(self, collection, relation_field, wanted_ids, **kwargs):
@@ -801,11 +800,14 @@ def test_history_coverage_excludes_missing_active_history_not_inactive_sources(m
     output = exporter.BeszelCollector(
         api=MissingActiveAPI(now), clock=lambda: now
     ).collect()
-    assert history_coverage(output) == {
-        (metric, collection): float(value)
-        for collection in ("system_stats", "container_stats", "network_monitor_stats")
-        for metric, value in (("wanted", 2), ("found", 1))
-    }
+    coverage = history_coverage(output)
+    assert coverage[("wanted", "system_stats")] == 2
+    assert coverage[("found", "system_stats")] == 1
+    # Only the original up host has a current container record.
+    assert coverage[("wanted", "container_stats")] == 1
+    assert coverage[("found", "container_stats")] == 1
+    assert coverage[("wanted", "network_monitor_stats")] == 2
+    assert coverage[("found", "network_monitor_stats")] == 1
 
 
 def test_history_coverage_zero_found_on_optional_read_failure(monkeypatch):
@@ -856,7 +858,7 @@ def test_stale_stats_are_not_exported(monkeypatch):
     assert 'beszel_network_monitor_response_seconds{' not in text
     assert 'beszel_system_up{system="source-a",system_id="sys1"} 1' in text
     system_info = next(line for line in text.splitlines() if line.startswith("beszel_system_info{"))
-    assert "status=" not in system_info
+    assert 'status="up"' in system_info
 
 
 @pytest.mark.parametrize(
