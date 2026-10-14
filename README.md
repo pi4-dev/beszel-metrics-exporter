@@ -93,8 +93,13 @@ unless on(system_id) beszel_system_stats_age_seconds
 ```
 
 Use a rule `for: 5m` (or an interval suitable for the scrape cadence) to
-avoid transient alerts at startup. For gaps in container history, replace
-`beszel_system_stats_age_seconds` with `beszel_container_stats_age_seconds`.
+avoid transient alerts at startup. For gaps in container history, restrict the comparison to systems with active
+containers. Beszel Hub creates `container_stats` only when the snapshot contains
+containers; hosts without them legitimately have no series. The exporter
+uses fresh `containers.updated` rows to define expected container-history
+sources in `beszel_exporter_history_records_wanted{collection="container_stats"}`.
+Because rows may persist after removal, the expected count is based on recently
+updated container IDs rather than all up systems.
 For enabled monitors, use:
 
 ```promql
@@ -214,7 +219,11 @@ example); the default 15 seconds leaves ~5 seconds for HTTP response overhead.
 limit rather than a strict total-response deadline. A server that continuously
 streams bytes slowly or CPU-heavy parsing can exceed the exact wall-clock
 limit inside a single operation; deadline checks stop subsequent work, but this
-is a cooperative rather than forcibly preemptive deadline.
+is a cooperative rather than forcibly preemptive deadline. DNS resolution is
+not guaranteed to honor the socket timeout either. The recommended 20-second
+vmagent scrape timeout and 30-second Gunicorn worker timeout provide outer
+safety nets, but their expiration does not make `SCRAPE_BUDGET_SECONDS`
+a hard execution deadline. Avoid setting it equal to the scraper timeout.
 
 ## Hub failure behavior
 
@@ -248,9 +257,11 @@ restart.
 
 Even with a reachable Hub, `status`, `state`, `substate` and `health`
 labels from container/SMART/systemd/pool records are omitted when the source
-system's statistics are stale. For hosts still marked `up` but missing
-fresh system statistics, `beszel_system_info` likewise omits `status`;
-`beszel_system_up` separately reflects the Hub's view of system status.
+system's statistics are stale. For hosts still marked `up` but missing fresh system statistics,
+`beszel_system_info` retains its `status` label from the Hub's `systems`
+record; `beszel_system_up` separately reflects this same Hub status.
+Runtime-only Wi-Fi SSID metadata is emitted only with fresh host statistics,
+never for an offline host or an up host with stale stats.
 When writing state/health alerts based on `*_info`, also gate on
 `beszel_exporter_up == 1` and `beszel_system_up == 1` to avoid conflating
 identity metadata with verified live state. The exporter-only alerts should
@@ -490,7 +501,7 @@ more labels.
 | `BESZEL_USER` | empty | Beszel user email |
 | `BESZEL_PASSWORD` | empty | Beszel password |
 | `BESZEL_TOKEN` | empty | Optional PocketBase auth token |
-| `REQUEST_TIMEOUT` | `10` | HTTP timeout per Hub request |
+| `REQUEST_TIMEOUT` | `10` | HTTP socket connect/read inactivity timeout per Hub request (not an end-to-end hard deadline) |
 | `SCRAPE_BUDGET_SECONDS` | `15` | Maximum collection budget (seconds), including collector-lock waiting and all Hub requests; keep below scraper timeout |
 | `CACHE_TTL` | `15` | Successful full-scrape cache TTL |
 | `FAILURE_CACHE_TTL` | `5` | Negative-cache TTL after a required Hub request fails |
@@ -503,6 +514,11 @@ more labels.
 | `LOG_LEVEL` | `INFO` | Python log level |
 | `LISTEN_HOST` | `0.0.0.0` | Gunicorn bind address |
 | `LISTEN_PORT` | `9105` | Gunicorn bind port |
+
+At startup the exporter rejects non-finite, negative or zero timeouts and
+freshness limits, non-positive bulk page settings, and invalid ports with a
+clear error naming the setting. `CACHE_TTL` and `FAILURE_CACHE_TTL`
+are allowed to be zero to disable caching.
 
 Unlike the initial implementation, `LISTEN_HOST` and `LISTEN_PORT` are used by both direct Python execution and the production Gunicorn container through `gunicorn.conf.py`.
 When using Docker Compose, the `environment:` values in `docker-compose.yaml` take precedence over `env_file:`, so change `LISTEN_HOST` and `LISTEN_PORT` in `docker-compose.override.yaml` and update `ports:` there as needed (editing only `beszel-metrics-exporter.env` will not change them).
@@ -845,8 +861,11 @@ beszel_exporter_dropped_samples_total
 The two `beszel_exporter_history_records_*` metrics are **gauges**, with
 exactly three `collection` label values: `system_stats`, `container_stats`,
 and `network_monitor_stats`. `wanted` counts **eligible distinct source IDs**:
-only systems with `status="up"` for `system_stats` and `container_stats`,
-and only `enabled` monitors assigned to up systems for `network_monitor_stats`.
+only systems with `status="up"` for `system_stats`; for `container_stats`
+only up systems with at least one recently updated container record (within
+`MAX_STATS_AGE_SECONDS`), because Beszel creates container history only for
+nonempty snapshots; and only `enabled` monitors assigned to up systems for
+`network_monitor_stats`.
 `found` counts the intersection of eligible IDs with IDs whose recent
 `type="1m"` history records were returned. These are source counts, not the
 total number of history rows; the names are preserved for query compatibility.

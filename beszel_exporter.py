@@ -18,6 +18,33 @@ import requests
 from flask import Flask, Response
 
 
+def env_positive_float(name: str, default: str, *, allow_zero: bool = False) -> float:
+    try:
+        value = float(os.getenv(name, default))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a finite positive number") from exc
+    if not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+        condition = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{name} must be a finite {condition} number")
+    return value
+
+
+def env_positive_int(name: str, default: str, *, max_value: int | None = None) -> int:
+    try:
+        value = int(os.getenv(name, default))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0 or (max_value is not None and value > max_value):
+        bound = f" between 1 and {max_value}" if max_value is not None else " greater than zero"
+        raise ValueError(f"{name} must be an integer{bound}")
+    return value
+
+
+def label_text(value: Any) -> str:
+    """Avoid serializing JSON null as the literal string 'None' in labels."""
+    return "" if value is None else str(value)
+
+
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -30,21 +57,19 @@ BESZEL_USER = os.getenv("BESZEL_USER", "")
 BESZEL_PASSWORD = os.getenv("BESZEL_PASSWORD", "")
 BESZEL_TOKEN = os.getenv("BESZEL_TOKEN", "")
 TOKEN_REFRESH_MARGIN_SECONDS = 600
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10"))
-SCRAPE_BUDGET_SECONDS = float(os.getenv("SCRAPE_BUDGET_SECONDS", "15"))
-if not math.isfinite(SCRAPE_BUDGET_SECONDS) or SCRAPE_BUDGET_SECONDS <= 0:
-    raise ValueError("SCRAPE_BUDGET_SECONDS must be a finite positive number")
-CACHE_TTL = float(os.getenv("CACHE_TTL", "15"))
-FAILURE_CACHE_TTL = float(os.getenv("FAILURE_CACHE_TTL", "5"))
-MAX_STATS_AGE_SECONDS = float(os.getenv("MAX_STATS_AGE_SECONDS", "180"))
+REQUEST_TIMEOUT = env_positive_float("REQUEST_TIMEOUT", "10")
+SCRAPE_BUDGET_SECONDS = env_positive_float("SCRAPE_BUDGET_SECONDS", "15")
+CACHE_TTL = env_positive_float("CACHE_TTL", "15", allow_zero=True)
+FAILURE_CACHE_TTL = env_positive_float("FAILURE_CACHE_TTL", "5", allow_zero=True)
+MAX_STATS_AGE_SECONDS = env_positive_float("MAX_STATS_AGE_SECONDS", "180")
 # Full systemd snapshots are refreshed every 10m; tolerate two intervals.
-MAX_SYSTEMD_AGE_SECONDS = float(os.getenv("MAX_SYSTEMD_AGE_SECONDS", "1200"))
-MAX_MONITOR_STATS_AGE_SECONDS = float(os.getenv("MAX_MONITOR_STATS_AGE_SECONDS", "600"))
-BULK_PAGE_SIZE = int(os.getenv("BULK_PAGE_SIZE", "500"))
-BULK_MAX_PAGES = int(os.getenv("BULK_MAX_PAGES", "5"))
+MAX_SYSTEMD_AGE_SECONDS = env_positive_float("MAX_SYSTEMD_AGE_SECONDS", "1200")
+MAX_MONITOR_STATS_AGE_SECONDS = env_positive_float("MAX_MONITOR_STATS_AGE_SECONDS", "600")
+BULK_PAGE_SIZE = env_positive_int("BULK_PAGE_SIZE", "500")
+BULK_MAX_PAGES = env_positive_int("BULK_MAX_PAGES", "5")
 LEGACY_UNITS = env_bool("LEGACY_UNITS", False)
 LISTEN_HOST = os.getenv("LISTEN_HOST", "0.0.0.0")
-LISTEN_PORT = int(os.getenv("LISTEN_PORT", "9105"))
+LISTEN_PORT = env_positive_int("LISTEN_PORT", "9105", max_value=65535)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
@@ -713,6 +738,18 @@ class BeszelCollector:
             and row.get("enabled")
             and row.get("system") in up_ids
         }
+        # Hub inserts container_stats only when a snapshot contains containers.
+        # Rows in 'containers' are upsert-only, so ignore retained stale rows.
+        active_container_system_ids = {
+            system_id for system_id in up_ids
+            if any(
+                row.get("id")
+                and (age := record_age_seconds({"created": row.get("updated")}, now))
+                is not None
+                and age <= MAX_STATS_AGE_SECONDS
+                for row in grouped["containers"][system_id]
+            )
+        }
         system_stats = self.optional_latest_by_relation(
             "system_stats",
             "system",
@@ -743,7 +780,7 @@ class BeszelCollector:
         # Read failures still increment collection_errors_total separately.
         for collection, wanted_ids, found in (
             ("system_stats", up_ids, system_stats),
-            ("container_stats", up_ids, container_stats),
+            ("container_stats", active_container_system_ids, container_stats),
             ("network_monitor_stats", enabled_monitor_ids, monitor_stats),
         ):
             history_labels = {"collection": collection}
@@ -790,7 +827,7 @@ class BeszelCollector:
                 stats_fresh = system_up and stats_age is not None and stats_age <= MAX_STATS_AGE_SECONDS
                 self.emit_system_record(
                     system_metrics, labels, system, details.get(system_id), system_up,
-                    include_status=stats_fresh or not system_up,
+                    include_wifi_info=stats_fresh,
                 )
                 if stats_fresh and stats_record:
                     self.emit_system_stats(system_metrics, labels, decoded(stats_record.get("stats"), {}))
@@ -892,6 +929,7 @@ class BeszelCollector:
         system_up: bool,
         *,
         include_status: bool = True,
+        include_wifi_info: bool = True,
     ) -> None:
         info = decoded(system.get("info"), {})
         details = details or {}
@@ -950,7 +988,9 @@ class BeszelCollector:
                                 labels,
                             )
 
-        for interface, station in decoded(info.get("wf"), {}).items():
+        for interface, station in (
+            decoded(info.get("wf"), {}).items() if include_wifi_info else ()
+        ):
             if isinstance(station, dict):
                 metrics.info(
                     "beszel_system_wifi_info",
@@ -1295,7 +1335,7 @@ class BeszelCollector:
                 attribute_labels = {
                     **data_labels,
                     "attribute": attribute.get("n", ""),
-                    "attribute_id": str(attribute.get("id", "")),
+                    "attribute_id": label_text(attribute.get("id")),
                 }
                 metrics.add("beszel_smart_attribute_value", attribute.get("v"), attribute_labels)
                 metrics.add("beszel_smart_attribute_worst", attribute.get("w"), attribute_labels)
@@ -1410,7 +1450,7 @@ class BeszelCollector:
                 "monitor_id": monitor_id,
                 "target": monitor.get("target", ""),
                 "protocol": monitor.get("protocol", ""),
-                "port": str(monitor.get("port", "")),
+                "port": label_text(monitor.get("port")),
                 "server": monitor.get("server", ""),
             }
             metrics.add("beszel_network_monitor_enabled", monitor.get("enabled"), monitor_labels)
